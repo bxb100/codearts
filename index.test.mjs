@@ -365,9 +365,10 @@ test("loader signs each chat request with SDK-HMAC-SHA256", async () => {
   assert.ok(headers.get("chat-id"))
   assert.ok(headers.get("session-id"))
   assert.equal(headers.has("maas_type"), false)
-  // The signed body is what goes on the wire; only `stream` is added so the
-  // gateway meters the request at all.
-  assert.equal(new TextDecoder().decode(seen[0].init.body), JSON.stringify({ model: "GLM-5.2", messages: [], stream: true }))
+  // Sign the rewritten body, including reasoning separation and metered streaming.
+  const body = new TextDecoder().decode(seen[0].init.body)
+  assert.deepEqual(JSON.parse(body), { model: "GLM-5.2", messages: [], thinking: { type: "enabled" }, stream: true })
+  assert.equal(headers.get("x-sdk-content-sha256"), await x.sha256Hex(buf(body)))
 })
 
 test("loader adds a signed maas_type header for benefit models", async () => {
@@ -388,6 +389,54 @@ test("loader adds a signed maas_type header for benefit models", async () => {
   assert.equal(headers.get("maas_type"), "benefit")
   assert.match(headers.get("authorization"), /SignedHeaders=[^,]*,/)
   assert.ok(headers.get("authorization").split("SignedHeaders=")[1].split(",")[0].includes("maas_type"))
+})
+
+for (const bodyType of ["string", "bytes", "request"]) {
+  test(`loader normalizes chat payloads from ${bodyType} bodies before signing`, async () => {
+    const cred = await makeCred()
+    const seen = []
+    const plugin = await CodeArtsAuthPlugin({}, { fetch: async (url, init) => {
+      seen.push(init)
+      return new Response("ok")
+    } })
+    const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+    const body = JSON.stringify({
+      model: "codearts/glm-5.3-flash",
+      messages: [],
+      max_completion_tokens: 100_000,
+      max_tokens: 100_000,
+    })
+    if (bodyType === "request") {
+      await loaded.fetch(new Request(x.CHAT_API_BASE, { method: "POST", body }))
+    } else {
+      await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: bodyType === "bytes" ? buf(body) : body })
+    }
+    assert.deepEqual(JSON.parse(new TextDecoder().decode(seen[0].body)), {
+      model: "glm-5.3-flash",
+      messages: [],
+      max_completion_tokens: 65_536,
+      max_tokens: 65_536,
+      thinking: { type: "enabled" },
+      stream: true,
+    })
+    const headers = new Headers(seen[0].headers)
+    assert.equal(headers.get("maas_type"), "benefit")
+    assert.ok(headers.get("authorization").split("SignedHeaders=")[1].split(",")[0].includes("maas_type"))
+    assert.equal(headers.get("x-sdk-content-sha256"), await x.sha256Hex(seen[0].body))
+  })
+}
+
+test("loader preserves explicit thinking and valid output budgets", async () => {
+  const cred = await makeCred()
+  const seen = []
+  const plugin = await CodeArtsAuthPlugin({}, { fetch: async (url, init) => {
+    seen.push(init)
+    return new Response("ok")
+  } })
+  const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+  const body = { model: "GLM-5.2", messages: [], stream: true, thinking: { type: "disabled" }, max_tokens: 1024 }
+  await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: JSON.stringify(body) })
+  assert.deepEqual(JSON.parse(new TextDecoder().decode(seen[0].body)), body)
 })
 
 test("loader returns nothing when not signed in", async () => {

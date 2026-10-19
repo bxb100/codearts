@@ -756,10 +756,10 @@ async function signedFetch(cred, input, init, context) {
   const headers = new Headers(init?.headers ?? req?.headers)
 
   let rawBody
-    if (init?.body != null) rawBody = await toBytes(init.body)
-    else if (req) rawBody = new Uint8Array(await req.clone().arrayBuffer())
-    else rawBody = new Uint8Array()
-  const raw = typeof init?.body === "string" ? safeJson(init.body) : null
+  if (init?.body != null) rawBody = await toBytes(init.body)
+  else if (req) rawBody = new Uint8Array(await req.clone().arrayBuffer())
+  else rawBody = new Uint8Array()
+  const raw = rawBody.length > 0 ? safeJson(new TextDecoder().decode(rawBody)) : null
   // The host hands the request down with the provider prefix on the model id
   // (`codearts/deepseek-v4.1-flash`), which the gateway does not know: it
   // answers InferHub.002002009.404 "model is not registered" (in an SSE frame
@@ -782,9 +782,10 @@ async function signedFetch(cred, input, init, context) {
     }
   }
   const model = raw?.model
+  const foldToCompletion = needsStreamMetering(raw)
+  if (foldToCompletion) raw.stream = true
   const body = raw ? utf8(JSON.stringify(raw)) : rawBody
   const extra = isBenefitModel(model) ? { maas_type: "benefit" } : undefined
-  const foldToCompletion = needsStreamMetering(body)
 
   // Signing is repeated on a credential renewal, so keep it a step of its own.
   let activeCred = cred
