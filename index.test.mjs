@@ -305,6 +305,25 @@ test("fetchRemoteModels marks every gateway id as benefit, dated ones included",
   for (const m of models) if (m.benefit) assert.equal(x.isBenefitModel(m.id), true, m.id)
 })
 
+test("extractArray rejects malformed payloads and missing paths", () => {
+  for (const text of ["", "not json", "null", "42", "{}", '{"result":null}', '{"result":{"models":{}}}']) {
+    assert.equal(x.extractArray(text, ["result", "models"]), undefined)
+  }
+  assert.deepEqual(x.extractArray('{"result":{"models":[]}}', ["result", "models"]), [])
+  assert.deepEqual(x.extractArray("[]", []), [])
+})
+
+test("fetchRemoteModels validates model entries at the parsing boundary", async () => {
+  const invalid = [null, false, 42, "model", [], {}, { model_id: 42 }, { model_id: "" }]
+  const models = await x.fetchRemoteModels(
+    { access_key_id: "AK", secret_access_key: "SK", security_token: "ST" },
+    async (url) => new Response(JSON.stringify(String(url).includes("opengw")
+      ? { result: { models: [...invalid, { model_id: "glm-5.3-flash" }] } }
+      : { builtinModels: [...invalid, { model_id: "GLM-5.2" }] })),
+  )
+  assert.deepEqual(models.map((m) => m.id), ["glm-5.3-flash", "GLM-5.2"])
+})
+
 test("signedGet returns undefined on a non-2xx response", async () => {
   const fetcher = async () => new Response("nope", { status: 401 })
   const text = await x.signedGet("https://example.com/x", { access_key_id: "AK", secret_access_key: "SK", security_token: "ST" }, fetcher)

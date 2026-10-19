@@ -288,7 +288,7 @@ async function signDpopJws(keyPair, htm, htu) {
 
 function buildCanonicalRequest(method, uri, query, headers, payloadHash) {
   const signedHeaders = [...headers.keys()].sort()
-  const headerLines = signedHeaders.map((k) => `${k}:${headers.get(k) ?? ""}`)
+  const headerLines = signedHeaders.map((k) => `${k}:${headers.get(k)}`)
   return [method, uri, query, headerLines.join("\n"), "", signedHeaders.join(";"), payloadHash].join("\n")
 }
 
@@ -332,13 +332,13 @@ async function signRequestHuawei(ak, sk, securityToken, method, urlStr, body, ex
 
 /** Normalize an STS token response into a persisted CodeArts credential. */
 function credentialFromTokenResponse(token, codeVerifier, keyPair) {
-  const c = token?.credentials ?? {}
+  const c = token.credentials ?? {}
   return {
     access_key_id: c.access_key_id ?? "",
     secret_access_key: c.secret_access_key ?? "",
     security_token: c.security_token ?? "",
     expires_at: c.expiration ?? "",
-    refresh_token: token?.refresh_token,
+    refresh_token: token.refresh_token,
     code_verifier: codeVerifier,
     dpop_private_key_jwk: keyPair.privateKeyJwk,
     // Minted once and kept across refreshes, so one account keeps one session.
@@ -427,7 +427,7 @@ async function refreshCredential(cred, fetcher) {
   if (!next.refresh_token) next.refresh_token = refreshToken
   // Preserve non-rotating identity fields a legacy login may have carried.
   for (const k of ["domain_id", "user_id", "user_name"]) {
-    if (cred[k] && !next[k]) next[k] = cred[k]
+    if (cred[k]) next[k] = cred[k]
   }
   // The session id belongs to the account, not to the token: keep the old one.
   if (cred.session_id) next.session_id = cred.session_id
@@ -506,7 +506,7 @@ async function pollForCredential(ticketId, secret, fetcher) {
     } catch {
       continue
     }
-    const cred = data ? parseLegacyCredential(data) : null
+    const cred = parseLegacyCredential(data)
     if (cred) return cred
   }
   throw new Error("CodeArts login timed out")
@@ -523,7 +523,7 @@ function startOAuthCallbackServer(ticketId, pkce, keyPair, fetcher) {
 
   const server = createServer((request, response) => {
     const url = new URL(request.url ?? "/", `http://127.0.0.1:${request.socket.localPort}`)
-    if (url.pathname !== REDIRECT_PATH && !url.pathname.startsWith(REDIRECT_PATH)) {
+    if (!url.pathname.startsWith(REDIRECT_PATH)) {
       response.writeHead(404).end("Not found")
       return
     }
@@ -545,7 +545,7 @@ function startOAuthCallbackServer(ticketId, pkce, keyPair, fetcher) {
     // New IAM OAuth: an authorization code to exchange at STS.
     const code = url.searchParams.get("code")
     if (code) {
-      const port = request.socket.localPort ?? 0
+      const port = request.socket.localPort
       void exchangeAuthorizationCode(code, pkce.codeVerifier, port, keyPair, fetcher).then(
         (token) => {
           response.writeHead(307, { ...CORS_HEADERS, Location: buildPortalLoginResultUrl(true) }).end()
@@ -570,8 +570,7 @@ function listenOnCallbackPort(server) {
     const tryListen = (port) => {
       server.once("error", reject)
       server.listen(port, "127.0.0.1", () => {
-        const address = server.address()
-        const assigned = typeof address === "object" && address ? address.port : 0
+        const assigned = server.address().port
         if (assigned >= MIN_CALLBACK_PORT) {
           resolve(assigned)
           return
@@ -606,7 +605,7 @@ async function startOAuthFlow(fetcher) {
     result,
     new Promise((_, reject) => {
       const timer = setTimeout(() => reject(new Error("CodeArts OAuth login timed out")), OAUTH_CALLBACK_TIMEOUT_MS)
-      timer.unref?.()
+      timer.unref()
     }),
   ]).then((outcome) => ({ ...outcome, loginUrl }))
 
@@ -626,7 +625,7 @@ async function toBytes(body) {
   if (body instanceof Uint8Array) return body
   if (body instanceof ArrayBuffer) return new Uint8Array(body)
   if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength)
-  if (typeof body?.getReader === "function") {
+  if (typeof body.getReader === "function") {
     const chunks = []
     const reader = body.getReader()
     for (;;) {
@@ -643,7 +642,7 @@ async function toBytes(body) {
     }
     return out
   }
-  if (typeof body?.arrayBuffer === "function") return new Uint8Array(await body.arrayBuffer())
+  if (typeof body.arrayBuffer === "function") return new Uint8Array(await body.arrayBuffer())
   return utf8(String(body))
 }
 
@@ -655,13 +654,13 @@ async function toBytes(body) {
  * caller asked for.
  */
 function needsStreamMetering(parsed) {
-  return !!parsed && typeof parsed === "object" && typeof parsed.model === "string" && Array.isArray(parsed.messages) && parsed.stream !== true
+  return typeof parsed?.model === "string" && Array.isArray(parsed.messages) && parsed.stream !== true
 }
 
 /** The JSON payloads of an SSE body, in arrival order, `[DONE]` skipped. */
 function parseSseEvents(text) {
   const events = []
-  for (const line of String(text).split(/\r?\n/)) {
+  for (const line of text.split(/\r?\n/)) {
     const s = line.trim()
     if (!s.startsWith("data:")) continue
     const payload = s.slice(5).trim()
@@ -735,8 +734,7 @@ async function finalizeChatAnswer(res, foldToCompletion) {
 
 /** Is `model` one that needs the signed `maas_type: benefit` header? */
 function isBenefitModel(model) {
-  const id = String(model ?? "")
-  return benefitModelIds.includes(id) || BENEFIT_MODEL_FALLBACK.includes(id)
+  return benefitModelIds.includes(model)
 }
 
 function rememberBenefitIds(ids) {
@@ -750,7 +748,7 @@ function rememberBenefitIds(ids) {
  * until upstream frees a session instead of reaching the caller.
  */
 async function signedFetch(cred, input, init, context) {
-  const req = typeof Request !== "undefined" && input instanceof Request ? input : null
+  const req = input instanceof Request ? input : null
   const url = req ? req.url : String(input)
   const method = String(init?.method ?? req?.method ?? "GET").toUpperCase()
   const headers = new Headers(init?.headers ?? req?.headers)
@@ -764,17 +762,15 @@ async function signedFetch(cred, input, init, context) {
   // (`codearts/deepseek-v4.1-flash`), which the gateway does not know: it
   // answers InferHub.002002009.404 "model is not registered" (in an SSE frame
   // when streaming, so it looks like a successful reply). Strip it.
-  if (raw && typeof raw.model === "string" && raw.model.startsWith(`${PROVIDER}/`)) {
-    raw.model = raw.model.slice(PROVIDER.length + 1)
-  }
-  // Ask for the answer, not the thinking — chat only, so introspection and
-  // non-chat bodies keep whatever shape they had.
-  if (raw && Array.isArray(raw.messages)) {
-    if (raw.thinking === undefined) raw.thinking = ENABLE_THINKING
-  }
-  // Keep the output budget inside what the gateway accepts, whatever default
-  // the caller picked.
   if (raw) {
+    if (typeof raw.model === "string" && raw.model.startsWith(`${PROVIDER}/`)) {
+      raw.model = raw.model.slice(PROVIDER.length + 1)
+    }
+    // Separate reasoning only for chat requests, preserving explicit settings.
+    if (Array.isArray(raw.messages) && raw.thinking === undefined) {
+      raw.thinking = ENABLE_THINKING
+    }
+    // Keep the caller's output budget within the gateway's limit.
     for (const k of ["max_completion_tokens", "max_tokens"]) {
       if (typeof raw[k] === "number" && raw[k] > MAX_OUTPUT_TOKENS) {
         raw[k] = MAX_OUTPUT_TOKENS
@@ -788,7 +784,6 @@ async function signedFetch(cred, input, init, context) {
   const extra = isBenefitModel(model) ? { maas_type: "benefit" } : undefined
 
   // Signing is repeated on a credential renewal, so keep it a step of its own.
-  let activeCred = cred
   const signWith = async (c) => {
     const signed = await signRequestHuawei(
       c.access_key_id, c.secret_access_key, c.security_token,
@@ -801,9 +796,9 @@ async function signedFetch(cred, input, init, context) {
     headers.set("Session-Id", context.sessionId)
     headers.set("lang", "en")
   }
-  await signWith(activeCred)
+  await signWith(cred)
 
-  const signal = init?.signal ?? req?.signal ?? undefined
+  const signal = init?.signal ?? req?.signal
   const request = {
     ...init,
     method,
@@ -815,7 +810,7 @@ async function signedFetch(cred, input, init, context) {
 
   // A credential already known to be beyond renewal never gets a network call:
   // every attempt would answer `APIG.0602` and burn a queue slot.
-  if (context.signInDead?.()) return signInExpiredResponse()
+  if (context.signInDead()) return signInExpiredResponse()
 
   if (signal?.aborted) throw abortError(signal)
   await context.gate.acquire()
@@ -844,12 +839,11 @@ async function signedFetch(cred, input, init, context) {
         // The temporary credential expired between signing and sending. Renew
         // the sign-in and send the same request again before reporting anything:
         // a bare 400 is not a shape magpie moves to another account on.
-        if (!renewed && isExpiredCredentialResponse(text) && context.renewCredential) {
+        if (!renewed && isExpiredCredentialResponse(text)) {
           renewed = true
           const next = await context.renewCredential()
           if (next) {
-            activeCred = next
-            await signWith(activeCred)
+            await signWith(next)
             continue
           }
           return signInExpiredResponse(text)
@@ -986,18 +980,18 @@ function isRetryableQueueCode(text) {
  * alike this way, so the code is the only thing that tells them apart.
  */
 function sseErrorCode(text) {
-  const m = /"error_code"\s*:\s*"([^"]+)"/.exec(String(text ?? ""))
+  const m = /"error_code"\s*:\s*"([^"]+)"/.exec(text)
   return m ? m[1] : ""
 }
 
 /** `InferHub.4291.x` is an exhausted quota; `8111x` is a per-minute limit. */
 function isQuotaExhaustedCode(code) {
-  return /4291/.test(String(code ?? ""))
+  return /4291/.test(code)
 }
 
 /** `APIG.0602` is the temporary credential past its expiry, not a bad request. */
 function isExpiredCredentialResponse(text) {
-  return /APIG\.0602|security token has expired/i.test(String(text ?? ""))
+  return /APIG\.0602|security token has expired/i.test(text)
 }
 
 /**
@@ -1078,10 +1072,7 @@ async function peekSseQueueError(res) {
     verdict = classifySseHead(seen)
     if (verdict || seen.length >= SSE_PEEK_LIMIT) break
     const { value, done } = await reader.read()
-    if (done) {
-      verdict = classifySseHead(seen)
-      break
-    }
+    if (done) break
     buffered.push(value)
     seen += decoder.decode(value, { stream: true })
   }
@@ -1141,7 +1132,7 @@ function signInExpiredResponse(body) {
 /** Answer the caller with a 429 when upstream never frees its queue. */
 function queueTerminalResponse(status) {
   return new Response(
-    JSON.stringify({ error_code: "TM.00001041", error_msg: firstOf(status?.message, "CodeArts: queue is full") }),
+    JSON.stringify({ error_code: "TM.00001041", error_msg: firstOf(status.message, "CodeArts: queue is full") }),
     { status: 429, headers: { "content-type": "application/json" } },
   )
 }
@@ -1205,9 +1196,7 @@ function parseModelInfo(m, seen) {
 }
 
 function extractArray(text, path) {
-  const root = safeJson(text)
-  if (!root) return undefined
-  let value = root
+  let value = safeJson(text)
   for (const key of path) {
     if (typeof value !== "object" || value === null) return undefined
     value = value[key]
@@ -1229,7 +1218,6 @@ async function fetchRemoteModels(cred, fetcher) {
   if (gatewayText !== undefined) {
     const arr = extractArray(gatewayText, ["result", "models"])
     for (const item of arr ?? []) {
-      if (typeof item !== "object" || item === null) continue
       const mi = parseModelInfo(item, seen)
       if (!mi) continue
       mi.benefit = true
@@ -1246,13 +1234,12 @@ async function fetchRemoteModels(cred, fetcher) {
   if (snapText !== undefined) {
     const arr = extractArray(snapText, ["builtinModels"])
     for (const item of arr ?? []) {
-      if (typeof item !== "object" || item === null) continue
       const mi = parseModelInfo(item, seen)
       if (mi) models.push(mi)
     }
   }
 
-  if (benefitIds.length > 0) rememberBenefitIds(benefitIds)
+  rememberBenefitIds(benefitIds)
   return models
 }
 
@@ -1288,7 +1275,7 @@ function benefitWindow(raw, ids = []) {
   const used = Math.max(0, Math.min(num(rec.daily_tokens_used), limit))
   return {
     name: BENEFIT_WINDOW_LABEL,
-    used: clamp((used / limit) * 100),
+    used: (used / limit) * 100,
     display: `${formatCredit(used)} / ${formatCredit(limit)}`,
     amount: used,
     limit,
@@ -1371,7 +1358,7 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
   }
 
   const configModel = (m) => ({
-    name: m.name ?? m.id,
+    name: m.name,
     limit: { context: m.context ?? 0, output: 0 },
     tool_call: true,
     // magpie's own field: the model is served from the free daily token pool,
@@ -1384,7 +1371,7 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
     return {
       ...base,
       id: live.id,
-      name: live.name || base.name || live.id,
+      name: live.name,
       limit: { context: live.context ?? base.limit?.context ?? 0, output: 0 },
       // Same source of truth as the signed `maas_type: benefit` header, so a
       // model never shows as free while being billed as paid, or the reverse.
@@ -1401,7 +1388,7 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
       p.name ??= "CodeArts"
       p.npm ??= NPM
       p.api ??= CHAT_API_BASE
-      p.models = { ...Object.fromEntries(CATALOG.map((m) => [m.id, configModel(m)])), ...(p.models ?? {}) }
+      p.models = { ...Object.fromEntries(CATALOG.map((m) => [m.id, configModel(m)])), ...p.models }
     },
 
     // The account's own list when signed in and CodeArts answers.
@@ -1409,7 +1396,7 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
       id: PROVIDER,
       async models(provider, { auth } = {}) {
         const cred = credentialOf(auth)
-        if (!cred?.access_key_id) return provider.models
+        if (!cred) return provider.models
         try {
           const list = await fetchRemoteModels(cred, fetcher)
           if (!list.length) return provider.models
@@ -1441,7 +1428,7 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
       async loader(getAuth) {
         const auth = await getAuth()
         let cred = credentialOf(auth)
-        if (!cred?.access_key_id || !cred?.secret_access_key) return {}
+        if (!cred || !cred.secret_access_key) return {}
 
         // Kept for hosts that ignore `auth.refresh` (OpenCode / old magpie):
         // refresh in-band when the credential is about to expire.
@@ -1498,7 +1485,7 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
       async usage(getAuth) {
         const auth = await getAuth()
         const cred = credentialOf(auth)
-        if (!cred?.access_key_id) return { error: "not signed in", windows: [] }
+        if (!cred) return { error: "not signed in", windows: [] }
         try {
           const text = await signedGet(SNAP_STATISTICS_URL, cred, fetcher, {
             "Agent-Type": "PromptCenter",
