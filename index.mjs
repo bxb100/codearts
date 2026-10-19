@@ -144,6 +144,18 @@ const CATALOG = [
   { id: "deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash" },
 ]
 
+// The gateway refuses a bigger output budget (RANGE_VALIDATOR: max_completion
+// tokens must be between 0 and 65536). Declaring no limit made callers pass
+// their own default, which is over it.
+const MAX_OUTPUT_TOKENS = 65_536
+// Thinking must be asked for EXPLICITLY: left to the default, the gateway
+// streams the model's reasoning inside `content` itself, so a caller shows the
+// thinking as the answer. With `thinking: { type: "enabled" }` the reasoning
+// goes to `reasoning_content` and `content` carries only the reply (measured:
+// default -> content and reasoning both "我们需要回答…"; enabled -> content
+// "1+1等于2。", reasoning kept apart).
+const ENABLE_THINKING = { type: "enabled" }
+
 // ---- small helpers ---------------------------------------------------------
 
 const firstOf = (...vs) => vs.find((v) => typeof v === "string" && v.trim())?.trim() ?? ""
@@ -742,16 +754,37 @@ async function signedFetch(cred, input, init, context) {
   const url = req ? req.url : String(input)
   const method = String(init?.method ?? req?.method ?? "GET").toUpperCase()
   const headers = new Headers(init?.headers ?? req?.headers)
-  let body
-  if (init?.body != null) body = await toBytes(init.body)
-  else if (req) body = new Uint8Array(await req.clone().arrayBuffer())
-  else body = new Uint8Array()
-  // The body is part of the signature, so any rewrite happens before signing.
-  const parsed = body.length > 0 ? safeJson(new TextDecoder().decode(body)) : null
-  const model = parsed?.model
+
+  let rawBody
+    if (init?.body != null) rawBody = await toBytes(init.body)
+    else if (req) rawBody = new Uint8Array(await req.clone().arrayBuffer())
+    else rawBody = new Uint8Array()
+  const raw = typeof init?.body === "string" ? safeJson(init.body) : null
+  // The host hands the request down with the provider prefix on the model id
+  // (`codearts/deepseek-v4.1-flash`), which the gateway does not know: it
+  // answers InferHub.002002009.404 "model is not registered" (in an SSE frame
+  // when streaming, so it looks like a successful reply). Strip it.
+  if (raw && typeof raw.model === "string" && raw.model.startsWith(`${PROVIDER}/`)) {
+    raw.model = raw.model.slice(PROVIDER.length + 1)
+  }
+  // Ask for the answer, not the thinking — chat only, so introspection and
+  // non-chat bodies keep whatever shape they had.
+  if (raw && Array.isArray(raw.messages)) {
+    if (raw.thinking === undefined) raw.thinking = ENABLE_THINKING
+  }
+  // Keep the output budget inside what the gateway accepts, whatever default
+  // the caller picked.
+  if (raw) {
+    for (const k of ["max_completion_tokens", "max_tokens"]) {
+      if (typeof raw[k] === "number" && raw[k] > MAX_OUTPUT_TOKENS) {
+        raw[k] = MAX_OUTPUT_TOKENS
+      }
+    }
+  }
+  const model = raw?.model
+  const body = raw ? utf8(JSON.stringify(raw)) : rawBody
   const extra = isBenefitModel(model) ? { maas_type: "benefit" } : undefined
-  const foldToCompletion = needsStreamMetering(parsed)
-  if (foldToCompletion) body = utf8(JSON.stringify({ ...parsed, stream: true }))
+  const foldToCompletion = needsStreamMetering(body)
 
   // Signing is repeated on a credential renewal, so keep it a step of its own.
   let activeCred = cred
