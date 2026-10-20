@@ -47,12 +47,12 @@ Chat Completions 都返回 HTTP 200 与真实 token 用量。
 
 见 [CodeArts provider 插件](../entities/codearts-plugin.md)：
 
-- `needsStreamMetering`：签名前把带 `model` + `messages` 且 `stream !== true` 的对话请求体
+- `signedFetch` 内的流式计量判定：签名前把带 `model` + `messages` 且 `stream !== true` 的对话请求体
   改写为 `stream: true`。改写必须在签名之前，请求体参与 `SDK-HMAC-SHA256` 的 payload hash。
 - `parseSseEvents` + `completionFromChunks`：把 SSE 折叠回 OpenAI 非流式 JSON
   （`content`、`reasoning_content`、按 `index` 拼接的 `tool_calls`、`finish_reason`、`usage`），
   宿主无感知。
-- `finalizeChatAnswer`：流内没有任何 `choices` 时判定为上游错误（额度、路由），
+- `foldStreamToCompletion`：流内没有任何 `choices` 时判定为上游错误（额度、路由），
   原样透传响应体，不折叠成空回答。宿主自己请求 `stream: true` 时完全不改。
 - `benefitWindow` + `usage`：用量面板增加「免费额度」窗口（单位 tokens），
   显示 benefit 池的每日已用/上限。
@@ -77,8 +77,8 @@ Chat Completions 都返回 HTTP 200 与真实 token 用量。
 
 > 免费标注与路由口径见 [CodeArts 用量窗口只让总积分参与路由](../decisions/codearts-usage-window-routing.md)。
 
-- `index.mjs`：`signedFetch`、`needsStreamMetering`、`parseSseEvents`、`completionFromChunks`、
-  `finalizeChatAnswer`、`benefitWindow`、`usageFromStatistics`、`auth.usage`
+- `index.mjs`：`signedFetch`、`parseSseEvents`、`completionFromChunks`、
+  `foldStreamToCompletion`、`benefitWindow`、`usageFromStatistics`、`auth.usage`
 - `index.test.mjs`：流式计量与折叠的 7 个用例
 - `README.md` / `DESIGN.md`：计费口径与流式计量说明
 

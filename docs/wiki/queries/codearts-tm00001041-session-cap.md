@@ -52,13 +52,13 @@ issue 实测：空闲后单发 1 次成功；并发 6 时 1 成功 5 失败；�
 ## 涉及模块
 
 - [CodeArts provider 插件](../entities/codearts-plugin.md)：`signedFetch`、
-  `queryQueueStatus`、`createConcurrencyGate`、`accountSessionIds`、loader 的上下文构造。
+  `queryQueueStatus`、`createConcurrencyGate`、loader 的上下文构造（账号级固定 `Session-Id`）。
 - magpie 侧：`maxConcurrency`（每账号在途请求上限）与账号故障切换；`providers.json`
   的 `pickedFrom` 是宿主配置，不在本仓库。
 
 ## 复发预防
 
-- 单测锁定判据：`isQueueErrorResponse` 只认 400 + `TM.00001041`；
+- 单测锁定判据：`signedFetch` 只把 400 + `TM.00001041` 当排队（其它状态码/错误码不重试）；
   `isRetryableQueueCode` 认得 `81111` / 独立的 `429` / `TM.00001041` 且**不**认额度码
   `InferHub.4291.200`；重试成功与耗尽两条路径的调用次数；SSE 内嵌排队错误的检测与
   重放、普通 200 正文完整透传；终态状态立即结束；闸门峰值等于 3。

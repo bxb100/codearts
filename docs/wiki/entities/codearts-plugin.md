@@ -20,7 +20,7 @@ status: active
 
 | 文件 | 说明 |
 | --- | --- |
-| `index.mjs` | 全部实现：签名（`signRequestHuawei` / `buildCanonicalRequest`）、PKCE 与 DPoP（`generatePkcePair` / `generateDpopKeyPair` / `signDpopJws`）、本地回调服务器（`startOAuthCallbackServer` / `startOAuthFlow`）、凭据续期（`requestToken` / `refreshCredential`）、请求签名与排队（`signedFetch` / `queryQueueStatus` / `createConcurrencyGate`）、模型目录（`fetchRemoteModels`）、用量（`usageFromStatistics`） |
+| `index.mjs` | 全部实现：签名（`signRequestHuawei` / `signHeaders`）、PKCE 与 DPoP（`generatePkcePair` / `generateDpopKeyPair` / `signDpopJws`）、本地回调服务器（`startOAuthFlow`，含回调服务器与端口选择）、凭据续期（`requestToken` / `refreshCredential`）、请求签名与排队（`signedFetch` / `queryQueueStatus` / `createConcurrencyGate`）、模型目录（`fetchRemoteModels`）、用量（`usageFromStatistics`） |
 | `index.test.mjs` | `node --test`，60 项，全部注入 `options.fetch`，不联网 |
 | `README.md` | 安装、登录、使用、已知限制 |
 | `DESIGN.md` | 参考实现映射、改造说明、并发与会话设计 |

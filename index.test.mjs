@@ -61,26 +61,18 @@ test("signDpopJws produces a verifiable ES256 dpop+jwt", async () => {
 
 // ---- SDK-HMAC-SHA256 signing -----------------------------------------------
 
-test("buildCanonicalRequest lays out the canonical request exactly", () => {
-  const headers = new Map([
-    ["host", "example.com"],
-    ["x-sdk-content-sha256", "H"],
-    ["x-sdk-date", "D"],
-    ["x-security-token", "ST"],
-  ])
-  const expected = [
-    "GET",
-    "/path/",
-    "",
-    "host:example.com",
-    "x-sdk-content-sha256:H",
-    "x-sdk-date:D",
-    "x-security-token:ST",
-    "",
-    "host;x-sdk-content-sha256;x-sdk-date;x-security-token",
-    "H",
-  ].join("\n")
-  assert.equal(x.buildCanonicalRequest("GET", "/path/", "", headers, "H"), expected)
+// Pins the canonical-request layout (method, trailing-slash path, query, sorted
+// headers, payload hash): a change to any of it changes this signature.
+test("signRequestHuawei produces the known signature for a fixed request", async () => {
+  const signed = await x.signRequestHuawei(
+    "AK", "SK", "ST", "POST", "https://example.com/api/v2/chat/completions?a=1",
+    buf('{"model":"glm-5.3-flash"}'), { maas_type: "benefit" }, "20260101T000000Z",
+  )
+  assert.equal(
+    signed.get("Authorization"),
+    "SDK-HMAC-SHA256 Access=AK,SignedHeaders=content-type;host;maas_type;x-sdk-content-sha256;x-sdk-date;x-security-token,"
+      + "Signature=5742d0e56e09784113fd8c6cbea532c52a99286bed665688cc5c9ae791ba0372",
+  )
 })
 
 test("signRequestHuawei signs a GET with the expected header set", async () => {
@@ -147,9 +139,8 @@ test("parseModelInfo keeps raw ids, drops vision models, dedupes, and fills cont
 
 test("parseModelInfo prefers the published context window over the static map", () => {
   const seen = new Set()
-  const a = x.parseModelInfo({ model_id: "glm-5.3-flash", context_window: 131072, max_tokens: 8192 }, seen)
+  const a = x.parseModelInfo({ model_id: "glm-5.3-flash", context_window: 131072 }, seen)
   assert.equal(a.context, 131072)
-  assert.equal(a.output, 8192)
 })
 
 test("credentialOf round-trips a credential stored in the access field", async () => {
@@ -248,11 +239,6 @@ test("usageFromStatistics surfaces a business error code", () => {
   assert.equal(usage.error, "boom")
 })
 
-test("toBytes normalizes strings and views", async () => {
-  assert.deepEqual(await x.toBytes("hi"), buf("hi"))
-  assert.deepEqual(await x.toBytes(buf("hi")), buf("hi"))
-  assert.equal((await x.toBytes(null)).length, 0)
-})
 
 test("isBenefitModel honours the static fallback", () => {
   assert.equal(x.isBenefitModel("glm-5.3-flash"), true)
@@ -410,7 +396,7 @@ test("loader adds a signed maas_type header for benefit models", async () => {
   assert.ok(headers.get("authorization").split("SignedHeaders=")[1].split(",")[0].includes("maas_type"))
 })
 
-for (const bodyType of ["string", "bytes", "request"]) {
+for (const bodyType of ["string", "bytes", "stream", "request"]) {
   test(`loader normalizes chat payloads from ${bodyType} bodies before signing`, async () => {
     const cred = await makeCred()
     const seen = []
@@ -428,7 +414,10 @@ for (const bodyType of ["string", "bytes", "request"]) {
     if (bodyType === "request") {
       await loaded.fetch(new Request(x.CHAT_API_BASE, { method: "POST", body }))
     } else {
-      await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: bodyType === "bytes" ? buf(body) : body })
+      const sent = bodyType === "bytes" ? buf(body)
+        : bodyType === "stream" ? new ReadableStream({ start(c) { c.enqueue(buf(body)); c.close() } })
+        : body
+      await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: sent })
     }
     assert.deepEqual(JSON.parse(new TextDecoder().decode(seen[0].body)), {
       model: "glm-5.3-flash",
@@ -560,10 +549,22 @@ const isQueueUrl = (url) => String(url).startsWith(x.QUEUE_STATUS_URL)
 
 const chatBody = (model) => JSON.stringify({ model, messages: [] })
 
-test("isQueueErrorResponse only accepts 400 with TM.00001041", () => {
-  assert.equal(x.isQueueErrorResponse(400, '{"error_code":"TM.00001041"}'), true)
-  assert.equal(x.isQueueErrorResponse(400, '{"error_code":"TM.00001042"}'), false)
-  assert.equal(x.isQueueErrorResponse(500, "TM.00001041"), false)
+test("signedFetch only treats 400 + TM.00001041 as a queue rejection", async () => {
+  const cred = await makeCred()
+  for (const [status, body] of [[400, '{"error_code":"TM.00001042"}'], [500, '{"error_code":"TM.00001041"}']]) {
+    let chatCalls = 0
+    const fetcher = async (url) => {
+      if (isQueueUrl(url)) return new Response("", { status: 404 })
+      chatCalls += 1
+      return new Response(body, { status })
+    }
+    const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher, queueRetryDelayMs: 1 })
+    const loaded = await plugin.auth.loader(async () => makeAuth(cred))
+    const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: JSON.stringify({ model: "GLM-5.2", messages: [] }) })
+    assert.equal(res.status, status)
+    assert.equal(await res.text(), body)
+    assert.equal(chatCalls, 1, `${status} ${body} must not be retried`)
+  }
 })
 
 test("signedFetch retries TM.00001041 until upstream frees a session", async () => {
@@ -710,14 +711,6 @@ test("sign-in mints a session id and refresh keeps it", async () => {
 
 // ---- streaming metering ----------------------------------------------------
 
-test("needsStreamMetering only rewrites a chat body the caller asked as JSON", () => {
-  assert.equal(x.needsStreamMetering({ model: "GLM-5.2", messages: [] }), true)
-  // Already streaming: upstream meters it, leave the caller's stream alone.
-  assert.equal(x.needsStreamMetering({ model: "GLM-5.2", messages: [], stream: true }), false)
-  assert.equal(x.needsStreamMetering({ model: "GLM-5.2" }), false)
-  assert.equal(x.needsStreamMetering({ messages: [] }), false)
-  assert.equal(x.needsStreamMetering(null), false)
-})
 
 test("completionFromChunks folds deltas, tool-call fragments, and usage", () => {
   const events = [
@@ -972,4 +965,322 @@ test("signedFetch delivers a plain 200 body unchanged", async () => {
   const res = await loaded.fetch(x.CHAT_API_BASE, { method: "POST", body: chatBody("GLM-5.2") })
   assert.equal(res.status, 200)
   assert.equal(await res.text(), "plain body")
+})
+
+// ---- daily check-in (签到) -------------------------------------------------
+
+function claimFetcher({ gate = { status: 200, body: { enabled: true } }, state, claim } = {}) {
+  const calls = []
+  const fetcher = async (url, init = {}) => {
+    const u = String(url)
+    // `auth.checkin` probes the IDE's signed ops route first; these cases are
+    // about the benefit-enrollment fallback, so the probe answers "no route"
+    // and is not recorded.
+    if (u.startsWith(x.SNAP_OPS_BASE)) {
+      return new Response(JSON.stringify({ error_code: "APIG.0101", error_msg: "no route" }), { status: 404 })
+    }
+    calls.push({ url: u, method: init.method ?? "GET" })
+    if (u === x.BENEFIT_GATEWAY_CONFIG_URL) {
+      return new Response(typeof gate.body === "string" ? gate.body : JSON.stringify(gate.body), { status: gate.status })
+    }
+    if (u === x.OPENGW_CLAIM_URL) {
+      const answer = (init.method ?? "GET") === "POST" ? claim : state
+      if (!answer) throw new Error(`unexpected ${init.method} ${u}`)
+      return new Response(typeof answer.body === "string" ? answer.body : JSON.stringify(answer.body), { status: answer.status ?? 200 })
+    }
+    throw new Error(`unexpected url ${u}`)
+  }
+  return { fetcher, calls }
+}
+
+const BENEFIT_RECORD = {
+  channel: "codearts", create_time: 1790309800964, update_time: 1790309800964,
+  domain_id: "d", expire_time: 0, user_id: "u", user_name: "someone",
+}
+
+test("auth.checkin enrols an account without a benefit record", async () => {
+  const cred = await makeCred()
+  const { fetcher, calls } = claimFetcher({
+    state: { body: { error_code: "0000", result: {} } },
+    claim: { body: { error_code: "0000", result: BENEFIT_RECORD } },
+  })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const outcome = await plugin.auth.checkin(async () => makeAuth(cred))
+  assert.equal(outcome.outcome, "claimed")
+  assert.match(outcome.message, /portal\/settings\/personal-usage/)
+  assert.equal("credit" in outcome, false, "the benefit record carries no points, so none may be invented")
+  assert.deepEqual(calls.map((c) => `${c.method} ${c.url}`), [
+    `GET ${x.BENEFIT_GATEWAY_CONFIG_URL}`,
+    `GET ${x.OPENGW_CLAIM_URL}`,
+    `POST ${x.OPENGW_CLAIM_URL}`,
+  ])
+})
+
+test("auth.checkin reports an enrolled account as no daily event", async () => {
+  const cred = await makeCred()
+  const { fetcher, calls } = claimFetcher({
+    state: { body: { error_code: "0000", result: BENEFIT_RECORD } },
+  })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const outcome = await plugin.auth.checkin(async () => makeAuth(cred))
+  assert.equal(outcome.outcome, "inactive")
+  assert.match(outcome.message, /已开通/)
+  assert.equal(calls.some((c) => c.method === "POST"), false, "a record must not be posted again: it changes nothing")
+})
+
+test("auth.checkin signs every call, gate headers included", async () => {
+  const cred = await makeCred()
+  const seen = []
+  const { fetcher } = claimFetcher({
+    state: { body: { error_code: "0000", result: {} } },
+    claim: { body: { error_code: "0000", result: BENEFIT_RECORD } },
+  })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, {
+    fetch: (url, init) => {
+      seen.push({ url: String(url), init })
+      return fetcher(url, init)
+    },
+  })
+  await plugin.auth.checkin(async () => makeAuth(cred))
+  for (const { init } of seen) {
+    const headers = new Headers(init.headers)
+    assert.match(headers.get("authorization") ?? "", /^SDK-HMAC-SHA256 Access=AK,SignedHeaders=[a-z0-9;-]+,Signature=[0-9a-f]{64}$/)
+    assert.equal(headers.get("x-security-token"), "ST")
+    assert.ok(headers.get("x-sdk-date"))
+  }
+  const gate = new Headers(seen[0].init.headers)
+  assert.equal(gate.get("agent-type"), "PromptCenter")
+  assert.ok(gate.get("authorization").includes("x-language"))
+})
+
+test("auth.checkin treats an already-claimed error as no event, not a claim", async () => {
+  const cred = await makeCred()
+  const { fetcher, calls } = claimFetcher({
+    state: { body: { error_code: "BENEFIT.0002", error_msg: "今日已领取" } },
+  })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const outcome = await plugin.auth.checkin(async () => makeAuth(cred))
+  assert.equal(outcome.outcome, "inactive")
+  assert.match(outcome.message, /今日已领取/)
+  assert.equal(calls.length, 2)
+})
+
+test("auth.checkin is inactive when the campaign switch is off", async () => {
+  const cred = await makeCred()
+  const { fetcher, calls } = claimFetcher({ gate: { status: 200, body: { enabled: false } } })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const outcome = await plugin.auth.checkin(async () => makeAuth(cred))
+  assert.equal(outcome.outcome, "inactive")
+  assert.equal(calls.length, 1)
+})
+
+test("auth.checkin is inactive when there is no campaign for the account", async () => {
+  const cred = await makeCred()
+  const { fetcher } = claimFetcher({ gate: { status: 404, body: "not found" } })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  assert.equal((await plugin.auth.checkin(async () => makeAuth(cred))).outcome, "inactive")
+})
+
+test("auth.checkin surfaces the vendor's refusal as a failure", async () => {
+  const cred = await makeCred()
+  const { fetcher } = claimFetcher({
+    state: { body: { error_code: "0000", result: {} } },
+    claim: { body: { error_code: "BENEFIT.0001", error_msg: "活动火爆，福利领取失败" } },
+  })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const outcome = await plugin.auth.checkin(async () => makeAuth(cred))
+  assert.equal(outcome.outcome, "failed")
+  assert.match(outcome.message, /活动火爆/)
+})
+
+test("auth.checkin never reads an unreadable answer as a claim", async () => {
+  const cred = await makeCred()
+  const { fetcher } = claimFetcher({
+    state: { body: { error_code: "0000", result: {} } },
+    claim: { body: "<html>gateway</html>" },
+  })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const outcome = await plugin.auth.checkin(async () => makeAuth(cred))
+  assert.equal(outcome.outcome, "failed")
+  assert.match(outcome.message, /benefit claim:/)
+})
+
+test("auth.checkin says not signed in without a credential", async () => {
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, {})
+  const outcome = await plugin.auth.checkin(async () => ({ type: "oauth", access: "" }))
+  assert.deepEqual(outcome, { outcome: "failed", message: "not signed in" })
+})
+
+test("parseClaimReply reads the Huawei envelope and its result", () => {
+  const ok = x.parseClaimReply(JSON.stringify({ error_code: "0000", result: BENEFIT_RECORD }))
+  assert.equal(ok.ok, true)
+  assert.equal(ok.data.user_id, "u")
+  const bad = x.parseClaimReply(JSON.stringify({ error_code: "E1", error_msg: "nope" }))
+  assert.equal(bad.ok, false)
+  assert.equal(bad.said, "nope")
+  assert.equal(x.parseClaimReply("junk").ok, false)
+})
+
+test("benefitRecord only accepts an actual benefit record", () => {
+  assert.equal(x.benefitRecord(BENEFIT_RECORD), true)
+  assert.equal(x.benefitRecord({ user_id: "u" }), true)
+  assert.equal(x.benefitRecord({ create_time: 1 }), true)
+  assert.equal(x.benefitRecord({}), false)
+  assert.equal(x.benefitRecord({ status: "CLAIMABLE" }), false)
+})
+
+test("gatewayEnabled only reads a boolean the answer actually carries", () => {
+  assert.equal(x.gatewayEnabled(JSON.stringify({ enabled: true })), true)
+  assert.equal(x.gatewayEnabled(JSON.stringify({ result: { enabled: false } })), false)
+  assert.equal(x.gatewayEnabled(JSON.stringify({ enabled: 1 })), true)
+  assert.equal(x.gatewayEnabled(JSON.stringify({ enabled: 0 })), false)
+  assert.equal(x.gatewayEnabled(JSON.stringify({})), undefined)
+  assert.equal(x.gatewayEnabled("junk"), undefined)
+})
+
+// ---- the IDE's signed ops check-in (no cookie) -----------------------------
+
+/**
+ * The signed route the IDE uses. Every call carries the signature headers, so
+ * a test can assert both the walk and that nothing is sent unsigned.
+ */
+function signedOpsFetcher({ states = [], claimBody, confirmBody, items, routeDown = false } = {}) {
+  const calls = []
+  let reads = 0
+  const fetcher = async (url, init = {}) => {
+    const u = String(url)
+    calls.push({ url: u, method: init.method ?? "GET", headers: new Headers(init.headers), body: init.body })
+    if (routeDown) {
+      return new Response(JSON.stringify({ error_code: "APIG.0101", error_msg: "no route" }), { status: 404 })
+    }
+    if (u.startsWith(x.SNAP_OPS_DELIVERY_URL)) {
+      const status = states[Math.min(reads++, Math.max(states.length - 1, 0))] ?? "ELIGIBLE"
+      return new Response(JSON.stringify({
+        code: 0,
+        data: { items: items ?? [{ campaignId: 1, type: "USER_LOGIN", status, totalAmount: 1000 }] },
+      }), { status: 200 })
+    }
+    if (u === x.SNAP_OPS_CLAIM_URL) {
+      return new Response(JSON.stringify(claimBody ?? {
+        code: 0,
+        data: { campaignId: 1, status: "CLAIMED", totalAmount: 1000 },
+      }), { status: 200 })
+    }
+    if (u === x.SNAP_OPS_CONFIRM_URL) {
+      return new Response(JSON.stringify(confirmBody ?? {
+        code: 0,
+        data: { campaignId: 1, status: "CONFIRMED", totalAmount: 1000 },
+      }), { status: 200 })
+    }
+    throw new Error(`unexpected ${u}`)
+  }
+  return { fetcher, calls }
+}
+
+test("auth.checkin claims and confirms on the IDE's signed route, no cookie", async () => {
+  const cred = await makeCred()
+  const { fetcher, calls } = signedOpsFetcher({ states: ["ELIGIBLE", "CONFIRMED"] })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const outcome = await plugin.auth.checkin(async () => makeAuth(cred))
+  assert.deepEqual(outcome, { outcome: "claimed", credit: 1000 })
+  // The confirm reply carries `status: CONFIRMED`, and that is the booking:
+  // no re-read is needed (and a re-read taken immediately after the write can
+  // still serve the pre-confirm snapshot).
+  assert.deepEqual(calls.map((c) => `${c.method} ${c.url}`), [
+    `GET ${x.SNAP_OPS_DELIVERY_URL}`,
+    `POST ${x.SNAP_OPS_CLAIM_URL}`,
+    `POST ${x.SNAP_OPS_CONFIRM_URL}`,
+  ])
+  const claim = JSON.parse(calls[1].body)
+  assert.equal(claim.campaignId, 1)
+  assert.equal(claim.channel, "IDE", "the signed route speaks the IDE channel")
+  assert.match(claim.idempotentKey, /^claim_1_\d+$/)
+  assert.deepEqual(JSON.parse(calls[2].body), { campaignId: 1 })
+  for (const call of calls) {
+    assert.match(call.headers.get("authorization"), /^SDK-HMAC-SHA256 Access=AK,SignedHeaders=/)
+    assert.equal(call.headers.get("x-security-token"), "ST")
+    assert.equal(call.headers.get("agent-type"), "PromptCenter")
+    assert.equal(call.headers.get("x-language"), "zh-cn")
+    assert.equal(call.headers.get("cookie"), null, "the signed route never needs a portal cookie")
+  }
+})
+
+test("signedCall hashes a string body the same way it sends it", async () => {
+  const { createHash } = await import("node:crypto")
+  const cred = await makeCred()
+  let seen
+  const fetcher = async (url, init) => {
+    seen = init
+    return new Response("{}", { status: 200 })
+  }
+  const body = JSON.stringify({ campaignId: 1, channel: "IDE" })
+  await x.signedCall(cred, fetcher, "POST", x.SNAP_OPS_CLAIM_URL, { body, signedHeaders: x.OPS_SIGNED_HEADERS })
+  const sent = await new Response(seen.body).text()
+  assert.equal(sent, body, "the signed body is the body that goes out")
+  assert.equal(
+    new Headers(seen.headers).get("x-sdk-content-sha256"),
+    createHash("sha256").update(body, "utf8").digest("hex"),
+    "a string body must be UTF-8 hashed, not coerced to a zero-length array",
+  )
+})
+
+test("auth.checkin re-reads when the confirm reply carries no state", async () => {
+  const cred = await makeCred()
+  const { fetcher, calls } = signedOpsFetcher({
+    states: ["ELIGIBLE", "CONFIRMED"],
+    confirmBody: { code: 0, data: { campaignId: 1 } },
+  })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const outcome = await plugin.auth.checkin(async () => makeAuth(cred))
+  assert.equal(outcome.outcome, "claimed")
+  assert.equal(outcome.credit, 1000)
+  assert.equal(calls.filter((c) => c.url === x.SNAP_OPS_DELIVERY_URL).length, 2, "one read to decide, one to verify")
+})
+
+test("auth.checkin reads 40001 as today's claim rather than a failure", async () => {
+  const cred = await makeCred()
+  const { fetcher, calls } = signedOpsFetcher({
+    states: ["ELIGIBLE", "CONFIRMED"],
+    claimBody: { code: 40001, message: "尚未到达权益刷新时间，暂时无法领取", data: null },
+  })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const outcome = await plugin.auth.checkin(async () => makeAuth(cred))
+  assert.equal(outcome.outcome, "claimed")
+  assert.equal(calls.filter((c) => c.url === x.SNAP_OPS_CONFIRM_URL).length, 1, "the confirm still runs")
+})
+
+test("auth.checkin reports an already booked signed check-in as done", async () => {
+  const cred = await makeCred()
+  const { fetcher, calls } = signedOpsFetcher({ states: ["CONFIRMED"] })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  assert.deepEqual(await plugin.auth.checkin(async () => makeAuth(cred)), { outcome: "done", credit: 1000 })
+  assert.equal(calls.length, 1)
+})
+
+test("auth.checkin confirms without claiming again when the signed route says CLAIMED", async () => {
+  const cred = await makeCred()
+  const { fetcher, calls } = signedOpsFetcher({ states: ["CLAIMED", "CONFIRMED"] })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const outcome = await plugin.auth.checkin(async () => makeAuth(cred))
+  assert.equal(outcome.outcome, "claimed")
+  assert.equal(calls.some((c) => c.url === x.SNAP_OPS_CLAIM_URL), false)
+  assert.equal(calls.filter((c) => c.url === x.SNAP_OPS_CONFIRM_URL).length, 1)
+})
+
+test("auth.checkin surfaces a refused signed claim and does not confirm it", async () => {
+  const cred = await makeCred()
+  const { fetcher, calls } = signedOpsFetcher({ states: ["ELIGIBLE"], claimBody: { code: 500, message: "活动火爆，领取失败" } })
+  const plugin = await CodeArtsAuthPlugin({ client: {} }, { fetch: fetcher })
+  const outcome = await plugin.auth.checkin(async () => makeAuth(cred))
+  assert.equal(outcome.outcome, "failed")
+  assert.match(outcome.message, /活动火爆/)
+  assert.equal(calls.some((c) => c.url === x.SNAP_OPS_CONFIRM_URL), false)
+})
+
+test("opsEnvelope reads the web app's code/data envelope", () => {
+  assert.equal(x.opsEnvelope(JSON.stringify({ code: 0, data: { items: [] } })).ok, true)
+  assert.equal(x.opsEnvelope(JSON.stringify({ code: 200, data: {} })).ok, true)
+  assert.equal(x.opsEnvelope(JSON.stringify({ code: 500, message: "boom" })).ok, false)
+  assert.equal(x.opsEnvelope(JSON.stringify({ code: 500, message: "boom" })).said, "boom")
+  assert.equal(x.opsEnvelope("junk").ok, false)
 })

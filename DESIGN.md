@@ -23,9 +23,9 @@ SDK-HMAC-SHA256 签名，凭据由 OAuth 换取。因此本插件的 auth 与签
 
 | 本插件实现 | 参考文件 | 作用 |
 | --- | --- | --- |
-| `startOAuthFlow` / `startOAuthCallbackServer` / `buildOAuthLoginUrl` | `login.ts` | 新式 IAM OAuth：本地回调服务器 + portal 授权 URL |
+| `startOAuthFlow` / `buildOAuthLoginUrl` | `login.ts` | 新式 IAM OAuth：本地回调服务器 + portal 授权 URL |
 | `generatePkcePair` / `generateDpopKeyPair` / `signDpopJws` / `requestToken` | `oauth.ts` | PKCE 与 DPoP（ES256）token 交换 |
-| `signRequestHuawei` / `buildCanonicalRequest` | `sign.ts` | 华为 SDK-HMAC-SHA256 请求签名 |
+| `signRequestHuawei` | `sign.ts` | 华为 SDK-HMAC-SHA256 请求签名 |
 | `fetchRemoteModels` / `parseModelInfo` / `normalizeModelId` | `models.ts` | 两个签名端点的模型列表 |
 | `signedFetch`（benefit 头、Chat-Id/Session-Id/lang） | `llm-adapter.ts` | Chat Completions 请求构造 |
 | `usageFromStatistics` | `codearts-credits.ts` | 积分套餐用量 |

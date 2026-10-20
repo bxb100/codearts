@@ -37,7 +37,6 @@
 import { createServer } from "node:http"
 
 const PROVIDER = "codearts"
-const NPM = "@ai-sdk/openai-compatible" // chat completions
 
 // ---- endpoints & flow constants --------------------------------------------
 
@@ -55,6 +54,18 @@ const OPENGW_GATEWAY_CONFIG_URL = "https://opengw.developer.huaweicloud.com/api/
 // It is a daily token allowance, separate from the credit packages above, so
 // without it a free model's spend is invisible in the usage panel.
 const BENEFIT_BALANCE_URL = "https://opengw.developer.huaweicloud.com/api/v1/user/tokens/balance"
+
+// check in
+const OPENGW_CLAIM_URL = "https://opengw.developer.huaweicloud.com/api/v1/benefit/claim"
+const BENEFIT_GATEWAY_CONFIG_URL = `${SNAP_HOST}/v1/benefit-gateway-config`
+const SNAP_OPS_BASE = `${SNAP_HOST}/v1/ops`
+const SNAP_OPS_DELIVERY_URL = `${SNAP_OPS_BASE}/delivery?channel=IDE`
+const SNAP_OPS_CLAIM_URL = `${SNAP_OPS_BASE}/claim`
+const SNAP_OPS_CONFIRM_URL = `${SNAP_OPS_BASE}/confirm`
+const OPS_CAMPAIGN_ID = 1 // the USER_LOGIN campaign: 每日签到领1000积分
+const OPS_REREAD_ATTEMPTS = 3
+const OPS_REREAD_DELAY_MS = 400
+
 // OAuth portal (new IAM flow) and the STS token endpoint.
 const PORTAL_AUTHORIZE_BASE = "https://codearts.huaweicloud.com/portal/authorize"
 const PORTAL_LOGIN_BASE = "https://codearts.huaweicloud.com/portal/login"
@@ -70,8 +81,6 @@ const LOGIN_PLUGIN_VERSION = "5.2.0"
 const OAUTH_THEME = "2" // activeColorTheme.kind: 2 = Dark
 const OAUTH_LOCALE = "zh-cn"
 
-const GRANT_AUTHORIZATION_CODE = "authorization_code"
-const GRANT_REFRESH_TOKEN = "refresh_token"
 
 const TOKEN_TIMEOUT_MS = 60_000
 const REQUEST_TIMEOUT_MS = 30_000
@@ -180,7 +189,6 @@ function num(v) {
   return 0
 }
 
-const clamp = (n) => Math.max(0, Math.min(100, n))
 
 // prettify is a model id as a name: openpangu-2.0-flash -> "Openpangu 2.0 Flash"
 function prettify(id) {
@@ -195,35 +203,17 @@ function prettify(id) {
 // -> deepseek-v4-flash. Only for the display name and the CONTEXT_WINDOWS
 // lookup. It must not rewrite ids sent to the backend: the dated form is the
 // registered free model and the bare form is a different, paid one.
-function normalizeModelId(id) {
-  if (typeof id === "string" && id.length > 5) {
-    const suffix = id.slice(-5)
-    if (suffix.startsWith("-") && /^\d{4}$/.test(suffix.slice(1))) return id.slice(0, -5)
-  }
-  return id
-}
+const normalizeModelId = (id) => id.replace(/(?<=.)-\d{4}$/, "")
 
 // ---- WebCrypto primitives --------------------------------------------------
 
-function subtle() {
-  const c = globalThis.crypto
-  if (!c?.subtle) throw new Error("CodeArts: WebCrypto (globalThis.crypto.subtle) is unavailable")
-  return c.subtle
-}
-
-const typed = (u8) => (u8 instanceof Uint8Array ? u8 : new Uint8Array(u8))
-
-function randomBytes(n) {
-  const out = new Uint8Array(n)
-  globalThis.crypto.getRandomValues(out)
-  return out
-}
+const utf8 = (s) => new TextEncoder().encode(s)
 
 const hex = (u8) => Array.from(u8).map((b) => b.toString(16).padStart(2, "0")).join("")
 
-function randomHex(n) {
-  return hex(randomBytes(n))
-}
+const randomBytes = (n) => crypto.getRandomValues(new Uint8Array(n))
+
+const randomHex = (n) => hex(randomBytes(n))
 
 function b64url(u8) {
   let s = ""
@@ -231,44 +221,36 @@ function b64url(u8) {
   return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
 }
 
-const utf8 = (s) => new TextEncoder().encode(s)
-
+// `data` is bytes, never a string: `new Uint8Array("…")` would coerce the
+// string to a number and hash as an empty body, so the signature would disagree
+// with the body actually sent (`APIG.0301 … body hash mismatch`).
 async function sha256Hex(data) {
-  const digest = await subtle().digest("SHA-256", typed(data))
-  return hex(new Uint8Array(digest))
+  return hex(new Uint8Array(await crypto.subtle.digest("SHA-256", data)))
 }
 
 async function hmacSha256Hex(key, data) {
-  const cryptoKey = await subtle().importKey(
-    "raw", typed(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"],
-  )
-  const sig = await subtle().sign("HMAC", cryptoKey, typed(data))
-  return hex(new Uint8Array(sig))
+  const cryptoKey = await crypto.subtle.importKey("raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"])
+  return hex(new Uint8Array(await crypto.subtle.sign("HMAC", cryptoKey, data)))
 }
 
 /** PKCE pair: a random 48-byte base64url verifier + its S256 challenge. */
 async function generatePkcePair() {
   const codeVerifier = b64url(randomBytes(48))
-  const digest = await subtle().digest("SHA-256", utf8(codeVerifier))
+  const digest = await crypto.subtle.digest("SHA-256", utf8(codeVerifier))
   return { codeVerifier, codeChallenge: b64url(new Uint8Array(digest)) }
 }
 
-/** Generate an ES256 (P-256) DPoP key pair as JWKs. */
-async function generateDpopKeyPair() {
-  const pair = await subtle().generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"])
-  const jwk = await subtle().exportKey("jwk", pair.privateKey)
+/** An ES256 (P-256) DPoP key pair as JWKs, from a private JWK. */
+function keyPairFromStoredJwk({ x, y, d }) {
   return {
-    privateKeyJwk: { kty: "EC", crv: "P-256", x: jwk.x, y: jwk.y, d: jwk.d },
-    publicKeyJwk: { kty: "EC", crv: "P-256", x: jwk.x, y: jwk.y },
+    privateKeyJwk: { kty: "EC", crv: "P-256", x, y, d },
+    publicKeyJwk: { kty: "EC", crv: "P-256", x, y },
   }
 }
 
-/** Recover a DPoP key pair from a persisted private JWK. */
-function keyPairFromStoredJwk(jwk) {
-  return {
-    privateKeyJwk: { kty: "EC", crv: "P-256", x: jwk.x, y: jwk.y, d: jwk.d },
-    publicKeyJwk: { kty: "EC", crv: "P-256", x: jwk.x, y: jwk.y },
-  }
+async function generateDpopKeyPair() {
+  const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"])
+  return keyPairFromStoredJwk(await crypto.subtle.exportKey("jwk", pair.privateKey))
 }
 
 /** Sign a `dpop+jwt` proof (htm=method, htu=URL) with the DPoP private key. */
@@ -276,50 +258,46 @@ async function signDpopJws(keyPair, htm, htu) {
   const header = { alg: "ES256", typ: "dpop+jwt", jwk: keyPair.publicKeyJwk }
   const payload = { htm, htu, iat: Math.floor(Date.now() / 1000), jti: randomHex(32) }
   const signingInput = `${b64url(utf8(JSON.stringify(header)))}.${b64url(utf8(JSON.stringify(payload)))}`
-  const key = await subtle().importKey(
+  const key = await crypto.subtle.importKey(
     "jwk", keyPair.privateKeyJwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"],
   )
-  const sig = await subtle().sign({ name: "ECDSA", hash: "SHA-256" }, key, utf8(signingInput))
+  const sig = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, utf8(signingInput))
   // WebCrypto ECDSA returns raw r||s, which is exactly the JWS ES256 format.
   return `${signingInput}.${b64url(new Uint8Array(sig))}`
 }
 
 // ---- Huawei SDK-HMAC-SHA256 request signing --------------------------------
 
-function buildCanonicalRequest(method, uri, query, headers, payloadHash) {
-  const signedHeaders = [...headers.keys()].sort()
-  const headerLines = signedHeaders.map((k) => `${k}:${headers.get(k)}`)
-  return [method, uri, query, headerLines.join("\n"), "", signedHeaders.join(";"), payloadHash].join("\n")
-}
-
 /**
  * Sign a Huawei request; returns the header map to merge into the request.
- * Extra headers (e.g. `maas_type: benefit`) participate in the canonical
- * request and must be sent verbatim, or the server rejects the signature.
+ * `body` is bytes or a string. Extra headers (e.g. `maas_type: benefit`)
+ * participate in the canonical request and must be sent verbatim, or the
+ * server rejects the signature.
  */
 async function signRequestHuawei(ak, sk, securityToken, method, urlStr, body, extraHeaders, dateStampOverride) {
+  method = method.toUpperCase()
   const url = new URL(urlStr)
-  let uri = url.pathname
-  if (!uri.endsWith("/")) uri += "/"
-  const query = url.search.slice(1)
+  const uri = url.pathname.endsWith("/") ? url.pathname : `${url.pathname}/`
   const dateStamp = dateStampOverride
     ?? new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z")
-  const payloadHash = await sha256Hex(body)
+  const payloadHash = await sha256Hex(typeof body === "string" ? utf8(body) : body)
 
-  const headers = new Map()
-  headers.set("host", url.host)
-  headers.set("x-sdk-date", dateStamp)
-  headers.set("x-sdk-content-sha256", payloadHash)
-  headers.set("x-security-token", securityToken)
-  if (extraHeaders !== undefined) {
-    for (const [k, v] of Object.entries(extraHeaders)) headers.set(k, v)
-  }
-  if (method.toUpperCase() !== "GET") headers.set("content-type", "application/json")
+  const headers = new Map([
+    ["host", url.host],
+    ["x-sdk-date", dateStamp],
+    ["x-sdk-content-sha256", payloadHash],
+    ["x-security-token", securityToken],
+    ...Object.entries(extraHeaders ?? {}),
+  ])
+  if (method !== "GET") headers.set("content-type", "application/json")
 
   const signedHeaders = [...headers.keys()].sort()
-  const canonicalRequest = buildCanonicalRequest(method.toUpperCase(), uri, query, headers, payloadHash)
-  const canonicalHash = await sha256Hex(utf8(canonicalRequest))
-  const stringToSign = `SDK-HMAC-SHA256\n${dateStamp}\n${canonicalHash}`
+  const canonicalRequest = [
+    method, uri, url.search.slice(1),
+    signedHeaders.map((k) => `${k}:${headers.get(k)}`).join("\n"), "",
+    signedHeaders.join(";"), payloadHash,
+  ].join("\n")
+  const stringToSign = `SDK-HMAC-SHA256\n${dateStamp}\n${await sha256Hex(utf8(canonicalRequest))}`
   const signature = await hmacSha256Hex(utf8(sk), utf8(stringToSign))
   headers.set(
     "Authorization",
@@ -328,22 +306,45 @@ async function signRequestHuawei(ak, sk, securityToken, method, urlStr, body, ex
   return headers
 }
 
+/** The headers to send for a request signed with `cred` (`host` is the fetcher's job). */
+async function signHeaders(cred, method, url, body, extraHeaders) {
+  const signed = await signRequestHuawei(
+    cred.access_key_id, cred.secret_access_key, cred.security_token, method, url, body, extraHeaders,
+  )
+  signed.delete("host")
+  return new Headers(signed)
+}
+
 // ---- OAuth token exchange --------------------------------------------------
 
-/** Normalize an STS token response into a persisted CodeArts credential. */
-function credentialFromTokenResponse(token, codeVerifier, keyPair) {
+/**
+ * Normalize an STS token response into a persisted CodeArts credential. On a
+ * refresh, `prev` is the credential being replaced: the rotating fields come
+ * from STS, the account's own identity (session id, a legacy login's ids, and
+ * the refresh token when STS does not rotate it) carries over.
+ */
+function credentialFromTokenResponse(token, codeVerifier, keyPair, prev = {}) {
   const c = token.credentials ?? {}
-  return {
+  const next = {
     access_key_id: c.access_key_id ?? "",
     secret_access_key: c.secret_access_key ?? "",
     security_token: c.security_token ?? "",
     expires_at: c.expiration ?? "",
-    refresh_token: token.refresh_token,
+    refresh_token: token.refresh_token || prev.refresh_token,
     code_verifier: codeVerifier,
     dpop_private_key_jwk: keyPair.privateKeyJwk,
     // Minted once and kept across refreshes, so one account keeps one session.
-    session_id: randomHex(16),
+    session_id: prev.session_id || randomHex(16),
   }
+  for (const k of ["domain_id", "user_id", "user_name"]) {
+    if (prev[k]) next[k] = prev[k]
+  }
+  return next
+}
+
+/** The auth record magpie stores for a credential (it lives in `access`). */
+function authRecord(cred) {
+  return { access: JSON.stringify(cred), refresh: cred.refresh_token, expires: expiresFromCredential(cred) }
 }
 
 /** The credential a sign-in carries; magpie keeps it in the `access` field. */
@@ -377,12 +378,7 @@ async function requestToken(body, keyPair, fetcher) {
   } catch (e) {
     throw new Error(`CodeArts token request network error: ${String(e)}`)
   }
-  let data = null
-  try {
-    data = await response.json()
-  } catch {
-    data = null
-  }
+  const data = await response.json().catch(() => null)
   if (!response.ok || !data?.credentials) {
     const message = `CodeArts token request failed: ${response.status}${data ? ` ${JSON.stringify(data)}` : ""}`
     // Only refresh_token invalidation is terminal; a transient DPoP rejection
@@ -396,25 +392,6 @@ async function requestToken(body, keyPair, fetcher) {
   return data
 }
 
-function exchangeAuthorizationCode(code, codeVerifier, port, keyPair, fetcher) {
-  return requestToken({
-    client_id: CLIENT_ID,
-    code,
-    code_verifier: codeVerifier,
-    grant_type: GRANT_AUTHORIZATION_CODE,
-    redirect_uri: `http://127.0.0.1:${port}${REDIRECT_PATH}`,
-  }, keyPair, fetcher)
-}
-
-function exchangeRefreshToken(refreshToken, codeVerifier, keyPair, fetcher) {
-  return requestToken({
-    client_id: CLIENT_ID,
-    code_verifier: codeVerifier,
-    grant_type: GRANT_REFRESH_TOKEN,
-    refresh_token: refreshToken,
-  }, keyPair, fetcher)
-}
-
 /** Refresh a stored credential, reusing its verifier + DPoP private key. */
 async function refreshCredential(cred, fetcher) {
   const refreshToken = firstOf(cred.refresh_token)
@@ -422,19 +399,19 @@ async function refreshCredential(cred, fetcher) {
     throw new Error("CodeArts: credential cannot be refreshed (missing refresh_token/code_verifier/dpop key)")
   }
   const keyPair = keyPairFromStoredJwk(cred.dpop_private_key_jwk)
-  const token = await exchangeRefreshToken(refreshToken, cred.code_verifier, keyPair, fetcher)
-  const next = credentialFromTokenResponse(token, cred.code_verifier, keyPair)
-  if (!next.refresh_token) next.refresh_token = refreshToken
-  // Preserve non-rotating identity fields a legacy login may have carried.
-  for (const k of ["domain_id", "user_id", "user_name"]) {
-    if (cred[k]) next[k] = cred[k]
-  }
-  // The session id belongs to the account, not to the token: keep the old one.
-  if (cred.session_id) next.session_id = cred.session_id
-  return next
+  const token = await requestToken({
+    client_id: CLIENT_ID,
+    code_verifier: cred.code_verifier,
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+  }, keyPair, fetcher)
+  return credentialFromTokenResponse(token, cred.code_verifier, keyPair, cred)
 }
 
 // ---- OAuth login: URL + loopback callback ----------------------------------
+
+const portalLoginResultUrl = (ok) =>
+  `${PORTAL_LOGIN_BASE}?login_succeed=${ok}&uri_scheme=${CLIENT_ID}&locale=${OAUTH_LOCALE}`
 
 /** Build the Huawei Cloud portal authorize URL (params mirror the real IDE). */
 function buildOAuthLoginUrl(port, pkce, ticketId) {
@@ -444,85 +421,65 @@ function buildOAuthLoginUrl(port, pkce, ticketId) {
     + `&ticket_id=${ticketId}&plugin-name=${LOGIN_PLUGIN_NAME}&plugin-version=${LOGIN_PLUGIN_VERSION}`
 }
 
-const buildPortalLoginResultUrl = (ok) =>
-  `${PORTAL_LOGIN_BASE}?login_succeed=${ok}&uri_scheme=${CLIENT_ID}&locale=${OAUTH_LOCALE}`
-
-/** Normalize a legacy ticket/credential response. */
-function parseLegacyCredential(data) {
-  const cred = data?.credential
-  if (cred) {
-    const ak = cred.access ?? ""
-    const st = cred.securitytoken ?? cred.securityToken ?? ""
-    if (ak && st) {
+/**
+ * Legacy fallback: poll the ticket endpoint until a credential arrives. The
+ * endpoint answers in one of two shapes (`credential` or `result`).
+ */
+async function pollForCredential(ticketId, secret, fetcher) {
+  const url = `${CREDENTIAL_ENDPOINT}?ticket_id=${encodeURIComponent(ticketId)}&secret=${encodeURIComponent(secret)}`
+  const headers = {
+    "Content-Type": "application/json;charset=UTF-8",
+    "plugin-name": LOGIN_PLUGIN_NAME,
+    "plugin-version": LOGIN_PLUGIN_VERSION,
+  }
+  for (let i = 0; i < LOGIN_POLL_ATTEMPTS; i++) {
+    if (i > 0) await delay(1000)
+    const data = await fetcher(url, { method: "GET", headers })
+      .then((res) => (res.ok ? res.json() : null))
+      .catch(() => null)
+    const c = data?.credential
+    const token = c?.securitytoken ?? c?.securityToken
+    if (c?.access && token) {
       return {
-        access_key_id: ak,
-        secret_access_key: cred.secret ?? "",
-        security_token: st,
-        expires_at: cred.expires_at ?? cred.expiresAt ?? "",
+        access_key_id: c.access,
+        secret_access_key: c.secret ?? "",
+        security_token: token,
+        expires_at: c.expires_at ?? c.expiresAt ?? "",
         domain_id: data.domain_id ?? "",
         user_id: data.user_id ?? "",
         user_name: data.user_name ?? "",
       }
     }
-  }
-  const r = data?.result
-  if (r) {
-    const ak = r.accessKeyId ?? ""
-    const st = r.securityToken ?? ""
-    if (ak && st) {
+    const r = data?.result
+    if (r?.accessKeyId && r.securityToken) {
       return {
-        access_key_id: ak,
+        access_key_id: r.accessKeyId,
         secret_access_key: r.secretAccessKey ?? "",
-        security_token: st,
+        security_token: r.securityToken,
         expires_at: r.expiration ?? r.expiresAt ?? "",
       }
     }
   }
-  return null
-}
-
-/** Poll the legacy ticket endpoint until a credential arrives. */
-async function pollForCredential(ticketId, secret, fetcher) {
-  const url = `${CREDENTIAL_ENDPOINT}?ticket_id=${encodeURIComponent(ticketId)}&secret=${encodeURIComponent(secret)}`
-  for (let i = 0; i < LOGIN_POLL_ATTEMPTS; i++) {
-    if (i > 0) await new Promise((r) => setTimeout(r, 1000))
-    let res
-    try {
-      res = await fetcher(url, {
-        method: "GET",
-        headers: {
-          "Content-Type": "application/json;charset=UTF-8",
-          "plugin-name": LOGIN_PLUGIN_NAME,
-          "plugin-version": LOGIN_PLUGIN_VERSION,
-        },
-      })
-    } catch {
-      continue
-    }
-    if (!res.ok) continue
-    let data = null
-    try {
-      data = await res.json()
-    } catch {
-      continue
-    }
-    const cred = parseLegacyCredential(data)
-    if (cred) return cred
-  }
   throw new Error("CodeArts login timed out")
 }
 
-/** Start the loopback callback server, listening on 127.0.0.1:port>=10000. */
-function startOAuthCallbackServer(ticketId, pkce, keyPair, fetcher) {
-  let resolveResult
-  let rejectResult
-  const result = new Promise((resolve, reject) => {
-    resolveResult = resolve
-    rejectResult = reject
-  })
+/**
+ * Start an OAuth flow and return its login URL immediately (magpie opens it).
+ * A loopback server on 127.0.0.1 (port >= 10000) waits for the browser to be
+ * redirected back; `result` resolves to the credential once STS answers and is
+ * rejected on failure or timeout. The server is closed as soon as it settles.
+ */
+async function startOAuthFlow(fetcher) {
+  const ticketId = randomHex(32)
+  const pkce = await generatePkcePair()
+  const keyPair = await generateDpopKeyPair()
+  let settle
+  const result = new Promise((resolve, reject) => { settle = { resolve, reject } })
 
   const server = createServer((request, response) => {
-    const url = new URL(request.url ?? "/", `http://127.0.0.1:${request.socket.localPort}`)
+    const port = request.socket.localPort
+    const url = new URL(request.url ?? "/", `http://127.0.0.1:${port}`)
+    const redirect = (to) => response.writeHead(307, { ...CORS_HEADERS, Location: to }).end()
     if (!url.pathname.startsWith(REDIRECT_PATH)) {
       response.writeHead(404).end("Not found")
       return
@@ -531,131 +488,67 @@ function startOAuthCallbackServer(ticketId, pkce, keyPair, fetcher) {
       response.writeHead(204, CORS_HEADERS).end()
       return
     }
-    const done = (cred) => resolveResult({ access: JSON.stringify(cred), expires: expiresFromCredential(cred) })
 
     // Legacy fallback: the portal decided OAuth is unavailable and redirected
     // with a secret; poll the ticket endpoint in the background.
-    const callbackSecret = url.searchParams.get("secret")
-    if (callbackSecret) {
-      const redirectTo = url.searchParams.get("redirect") ?? buildPortalLoginResultUrl(true)
-      response.writeHead(307, { ...CORS_HEADERS, Location: redirectTo }).end()
-      void pollForCredential(ticketId, callbackSecret, fetcher).then(done, rejectResult)
+    const secret = url.searchParams.get("secret")
+    if (secret) {
+      redirect(url.searchParams.get("redirect") ?? portalLoginResultUrl(true))
+      pollForCredential(ticketId, secret, fetcher).then(settle.resolve, settle.reject)
       return
     }
+
     // New IAM OAuth: an authorization code to exchange at STS.
     const code = url.searchParams.get("code")
-    if (code) {
-      const port = request.socket.localPort
-      void exchangeAuthorizationCode(code, pkce.codeVerifier, port, keyPair, fetcher).then(
-        (token) => {
-          response.writeHead(307, { ...CORS_HEADERS, Location: buildPortalLoginResultUrl(true) }).end()
-          done(credentialFromTokenResponse(token, pkce.codeVerifier, keyPair))
-        },
-        (error) => {
-          response.writeHead(307, { ...CORS_HEADERS, Location: buildPortalLoginResultUrl(false) }).end()
-          rejectResult(error)
-        },
-      )
+    if (!code) {
+      response.writeHead(400).end("Missing authorization code or secret")
       return
     }
-    response.writeHead(400).end("Missing authorization code or secret")
+    requestToken({
+      client_id: CLIENT_ID,
+      code,
+      code_verifier: pkce.codeVerifier,
+      grant_type: "authorization_code",
+      redirect_uri: `http://127.0.0.1:${port}${REDIRECT_PATH}`,
+    }, keyPair, fetcher).then(
+      (token) => {
+        redirect(portalLoginResultUrl(true))
+        settle.resolve(credentialFromTokenResponse(token, pkce.codeVerifier, keyPair))
+      },
+      (error) => {
+        redirect(portalLoginResultUrl(false))
+        settle.reject(error)
+      },
+    )
   })
 
-  return listenOnCallbackPort(server).then((port) => ({ port, server, result }))
-}
-
-/** Listen on 127.0.0.1, retrying with a random port >= 10000 if needed. */
-function listenOnCallbackPort(server) {
-  return new Promise((resolve, reject) => {
-    const tryListen = (port) => {
-      server.once("error", reject)
-      server.listen(port, "127.0.0.1", () => {
-        const assigned = server.address().port
-        if (assigned >= MIN_CALLBACK_PORT) {
-          resolve(assigned)
-          return
-        }
-        server.close(() => tryListen(Math.floor(Math.random() * (65_536 - MIN_CALLBACK_PORT)) + MIN_CALLBACK_PORT))
-      })
-    }
-    tryListen(0)
+  // Listen on a free port; the portal wants one >= 10000, so retry on a random
+  // high port if the OS hands out a lower one.
+  const port = await new Promise((resolve, reject) => {
+    server.once("error", reject)
+    const listen = (wanted) => server.listen(wanted, "127.0.0.1", () => {
+      const { port } = server.address()
+      if (port >= MIN_CALLBACK_PORT) resolve(port)
+      else server.close(() => listen(MIN_CALLBACK_PORT + Math.floor(Math.random() * (65_536 - MIN_CALLBACK_PORT))))
+    })
+    listen(0)
   })
-}
 
-/**
- * Start an OAuth flow and return its login URL immediately (magpie opens it).
- * The result resolves once the browser is redirected back and STS answers;
- * the callback server is closed as soon as the result settles.
- */
-async function startOAuthFlow(fetcher) {
-  const ticketId = randomHex(32)
-  const pkce = await generatePkcePair()
-  const keyPair = await generateDpopKeyPair()
-  const { port, server, result } = await startOAuthCallbackServer(ticketId, pkce, keyPair, fetcher)
-  const loginUrl = buildOAuthLoginUrl(port, pkce, ticketId)
-
-  let closed = false
+  const timer = setTimeout(() => settle.reject(new Error("CodeArts OAuth login timed out")), OAUTH_CALLBACK_TIMEOUT_MS)
+  timer.unref()
   const close = async () => {
-    if (closed) return
-    closed = true
-    await new Promise((resolve) => server.close(() => resolve()))
+    clearTimeout(timer)
+    if (server.listening) await new Promise((resolve) => server.close(() => resolve()))
   }
-
-  const resultWithUrl = Promise.race([
-    result,
-    new Promise((_, reject) => {
-      const timer = setTimeout(() => reject(new Error("CodeArts OAuth login timed out")), OAUTH_CALLBACK_TIMEOUT_MS)
-      timer.unref()
-    }),
-  ]).then((outcome) => ({ ...outcome, loginUrl }))
-
   // Settle in the background so an early result never becomes an unhandled
   // rejection, and so the listening socket is always released.
-  resultWithUrl.catch(() => {}).finally(() => { void close() })
+  result.catch(() => {}).finally(close)
 
-  return { loginUrl, result: resultWithUrl, close }
+  return { loginUrl: buildOAuthLoginUrl(port, pkce, ticketId), result, close }
 }
+
 
 // ---- signed requests to CodeArts -------------------------------------------
-
-/** Turn a request body (string / bytes / stream / blob) into bytes. */
-async function toBytes(body) {
-  if (body == null) return new Uint8Array()
-  if (typeof body === "string") return utf8(body)
-  if (body instanceof Uint8Array) return body
-  if (body instanceof ArrayBuffer) return new Uint8Array(body)
-  if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength)
-  if (typeof body.getReader === "function") {
-    const chunks = []
-    const reader = body.getReader()
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      chunks.push(typed(value))
-    }
-    const total = chunks.reduce((n, c) => n + c.length, 0)
-    const out = new Uint8Array(total)
-    let offset = 0
-    for (const c of chunks) {
-      out.set(c, offset)
-      offset += c.length
-    }
-    return out
-  }
-  if (typeof body.arrayBuffer === "function") return new Uint8Array(await body.arrayBuffer())
-  return utf8(String(body))
-}
-
-/**
- * CodeArts meters a chat only when the answer comes back as an SSE stream: a
- * non-streaming 200 returns tokens yet leaves `usageTotalPackageCredit`
- * untouched, so its cost never reaches the credits pool. Send every chat
- * upstream as `stream: true` and fold the stream back into the shape the
- * caller asked for.
- */
-function needsStreamMetering(parsed) {
-  return typeof parsed?.model === "string" && Array.isArray(parsed.messages) && parsed.stream !== true
-}
 
 /** The JSON payloads of an SSE body, in arrival order, `[DONE]` skipped. */
 function parseSseEvents(text) {
@@ -717,12 +610,10 @@ function completionFromChunks(events) {
  * an upstream error (quota, routing), and that payload must reach the caller
  * byte-for-byte rather than be turned into an empty completion.
  */
-async function finalizeChatAnswer(res, foldToCompletion) {
-  if (!foldToCompletion) return res
+async function foldStreamToCompletion(res) {
   const text = await res.text()
   const events = parseSseEvents(text)
-  const answered = events.some((ev) => Array.isArray(ev.choices) && ev.choices.length > 0)
-  if (!answered) return rebuildResponse(res, text)
+  if (!events.some((ev) => Array.isArray(ev.choices) && ev.choices.length > 0)) return rebuildResponse(res, text)
   const headers = streamHeaders(res.headers)
   headers.set("content-type", "application/json")
   return new Response(JSON.stringify(completionFromChunks(events)), {
@@ -737,10 +628,6 @@ function isBenefitModel(model) {
   return benefitModelIds.includes(model)
 }
 
-function rememberBenefitIds(ids) {
-  for (const id of ids) if (!benefitModelIds.includes(id)) benefitModelIds.push(id)
-}
-
 /**
  * The plugin's per-request fetch: sign the outgoing chat request with the
  * account's temporary credentials, then send it. Requests beyond the
@@ -748,15 +635,19 @@ function rememberBenefitIds(ids) {
  * until upstream frees a session instead of reaching the caller.
  */
 async function signedFetch(cred, input, init, context) {
+  // A credential already known to be beyond renewal never gets a network call:
+  // every attempt would answer `APIG.0602` and burn a queue slot.
+  if (context.signInDead()) return signInExpiredResponse()
+
   const req = input instanceof Request ? input : null
   const url = req ? req.url : String(input)
   const method = String(init?.method ?? req?.method ?? "GET").toUpperCase()
   const headers = new Headers(init?.headers ?? req?.headers)
+  const signal = init?.signal ?? req?.signal
+  if (signal?.aborted) throw abortError(signal)
 
-  let rawBody
-  if (init?.body != null) rawBody = await toBytes(init.body)
-  else if (req) rawBody = new Uint8Array(await req.clone().arrayBuffer())
-  else rawBody = new Uint8Array()
+  const source = init?.body ?? req?.clone().body
+  const rawBody = source == null ? new Uint8Array() : new Uint8Array(await new Response(source).arrayBuffer())
   const raw = rawBody.length > 0 ? safeJson(new TextDecoder().decode(rawBody)) : null
   // The host hands the request down with the provider prefix on the model id
   // (`codearts/deepseek-v4.1-flash`), which the gateway does not know: it
@@ -767,52 +658,38 @@ async function signedFetch(cred, input, init, context) {
       raw.model = raw.model.slice(PROVIDER.length + 1)
     }
     // Separate reasoning only for chat requests, preserving explicit settings.
-    if (Array.isArray(raw.messages) && raw.thinking === undefined) {
-      raw.thinking = ENABLE_THINKING
-    }
+    if (Array.isArray(raw.messages) && raw.thinking === undefined) raw.thinking = ENABLE_THINKING
     // Keep the caller's output budget within the gateway's limit.
     for (const k of ["max_completion_tokens", "max_tokens"]) {
-      if (typeof raw[k] === "number" && raw[k] > MAX_OUTPUT_TOKENS) {
-        raw[k] = MAX_OUTPUT_TOKENS
-      }
+      if (typeof raw[k] === "number" && raw[k] > MAX_OUTPUT_TOKENS) raw[k] = MAX_OUTPUT_TOKENS
     }
   }
   const model = raw?.model
-  const foldToCompletion = needsStreamMetering(raw)
+  // CodeArts meters a chat only when the answer comes back as an SSE stream: a
+  // non-streaming 200 returns tokens yet leaves `usageTotalPackageCredit`
+  // untouched, so its cost never reaches the credits pool. Send every chat
+  // upstream as `stream: true` and fold the stream back into the shape the
+  // caller asked for.
+  const foldToCompletion = typeof model === "string" && Array.isArray(raw.messages) && raw.stream !== true
   if (foldToCompletion) raw.stream = true
   const body = raw ? utf8(JSON.stringify(raw)) : rawBody
   const extra = isBenefitModel(model) ? { maas_type: "benefit" } : undefined
 
-  // Signing is repeated on a credential renewal, so keep it a step of its own.
-  const signWith = async (c) => {
-    const signed = await signRequestHuawei(
-      c.access_key_id, c.secret_access_key, c.security_token,
-      method, url, body, extra,
-    )
-    signed.forEach((value, key) => {
-      if (key !== "host") headers.set(key, value)
-    })
-    headers.set("Chat-Id", context.chatId)
-    headers.set("Session-Id", context.sessionId)
-    headers.set("lang", "en")
+  headers.set("Chat-Id", context.chatId)
+  headers.set("Session-Id", context.sessionId)
+  headers.set("lang", "en")
+  // Signing is repeated on a credential renewal; `active` is the credential
+  // the request (and its queue probes) currently go out with.
+  let active = cred
+  const sign = async () => {
+    for (const [key, value] of await signHeaders(active, method, url, body, extra)) headers.set(key, value)
   }
-  await signWith(cred)
+  await sign()
+  const request = { ...init, method, headers, ...(body.length > 0 ? { body } : {}), signal }
+  const probe = () => queryQueueStatus(active, model, { ...context, signal })
+  // `error` / `queue_full` never turn into a success, so stop waiting.
+  const hopeless = (probed) => probed?.status === "error" || probed?.status === "queue_full"
 
-  const signal = init?.signal ?? req?.signal
-  const request = {
-    ...init,
-    method,
-    headers,
-    ...(body.length > 0 ? { body } : {}),
-    signal,
-  }
-  const queueContext = { ...context, signal }
-
-  // A credential already known to be beyond renewal never gets a network call:
-  // every attempt would answer `APIG.0602` and burn a queue slot.
-  if (context.signInDead()) return signInExpiredResponse()
-
-  if (signal?.aborted) throw abortError(signal)
   await context.gate.acquire()
   try {
     let renewed = false
@@ -824,37 +701,36 @@ async function signedFetch(cred, input, init, context) {
         h.set("X-Magpie-Sign-In", "expired")
         return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h })
       }
-      // A 200 can still be a queue rejection: CodeArts sometimes embeds the
-      // error in the SSE stream instead of answering 400.
       let queued = false
       let answer = null
       if (res.ok) {
+        // A 200 can still be a queue rejection: CodeArts sometimes embeds the
+        // error in the SSE stream instead of answering 400.
         const peeked = await peekSseQueueError(res)
-        if (!peeked.retry) return finalizeChatAnswer(peeked.response, foldToCompletion)
-        const probed = await queryQueueStatus(cred, model, queueContext)
-        if (probed?.status === "error" || probed?.status === "queue_full") return queueTerminalResponse(probed)
+        if (peeked) return foldToCompletion ? foldStreamToCompletion(peeked) : peeked
+        const probed = await probe()
+        if (hopeless(probed)) return queueTerminalResponse(probed)
         queued = true
       } else {
         const text = await res.text().catch(() => "")
-        // The temporary credential expired between signing and sending. Renew
-        // the sign-in and send the same request again before reporting anything:
-        // a bare 400 is not a shape magpie moves to another account on.
-        if (!renewed && isExpiredCredentialResponse(text)) {
+        // The temporary credential expired between signing and sending (`APIG.0602`,
+        // a bare 400 magpie does not move to another account on). Renew the
+        // sign-in and send the same request again before reporting anything.
+        if (!renewed && /APIG\.0602|security token has expired/i.test(text)) {
           renewed = true
           const next = await context.renewCredential()
-          if (next) {
-            await signWith(next)
-            continue
-          }
-          return signInExpiredResponse(text)
+          if (!next) return signInExpiredResponse(text)
+          active = next
+          await sign()
+          continue
         }
         answer = rebuildResponse(res, text)
         // A non-queue error still probes the status endpoint first: some models
         // report the cap with another code yet still land in the queue.
-        const probed = await queryQueueStatus(cred, model, queueContext)
-        queued = isQueueErrorResponse(res.status, text) || probed?.status === "waiting"
-        // `error` / `queue_full` never turn into a success, so stop waiting.
-        if (queued && (probed?.status === "error" || probed?.status === "queue_full")) return answer
+        const probed = await probe()
+        // `400` + `TM.00001041` is transient account capacity, not a bad request.
+        queued = (res.status === 400 && text.includes("TM.00001041")) || probed?.status === "waiting"
+        if (queued && hopeless(probed)) return answer
       }
 
       if (!queued || attempt >= context.queueMaxAttempts) {
@@ -869,25 +745,280 @@ async function signedFetch(cred, input, init, context) {
   }
 }
 
-/** A signed GET returning the response text, or undefined on any failure. */
-async function signedGet(url, cred, fetcher, extraUnsignedHeaders) {
-  const signed = await signRequestHuawei(
-    cred.access_key_id, cred.secret_access_key, cred.security_token,
-    "GET", url, new Uint8Array(),
-  )
-  const headers = new Headers()
-  signed.forEach((value, key) => {
-    if (key !== "host") headers.set(key, value)
+/**
+ * One signed call. `signedHeaders` take part in the signature; `headers` are
+ * sent as-is, unsigned. GET calls carry no body.
+ */
+async function signedCall(cred, fetcher, method, url, { body = "", signedHeaders, headers, signal } = {}) {
+  const isGet = method === "GET"
+  const sent = await signHeaders(cred, method, url, isGet ? new Uint8Array() : body, signedHeaders)
+  for (const [k, v] of Object.entries(headers ?? {})) sent.set(k, v)
+  const res = await fetcher(url, {
+    method,
+    headers: sent,
+    ...(isGet ? {} : { body }),
+    signal: signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   })
-  if (extraUnsignedHeaders !== undefined) {
-    for (const [k, v] of Object.entries(extraUnsignedHeaders)) headers.set(k, v)
-  }
+  return { status: res.status, text: await res.text() }
+}
+
+/** A signed GET returning the response text, or undefined on any failure. */
+async function signedGet(url, cred, fetcher, headers) {
   try {
-    const res = await fetcher(url, { method: "GET", headers, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
-    if (!res.ok) return undefined
-    return await res.text()
+    const { status, text } = await signedCall(cred, fetcher, "GET", url, { headers })
+    return status >= 200 && status < 300 ? text : undefined
   } catch {
     return undefined
+  }
+}
+
+// ---- daily check-in (签到) -------------------------------------------------
+
+const saidMatches = (said, words) => {
+  const s = String(said ?? "").toLowerCase()
+  return words.some((w) => s.includes(w))
+}
+
+// Fixme: normal path really need errorcode?
+/** The benefit endpoints' envelope: `{error_code, result}`. */
+function parseClaimReply(text) {
+  const json = safeJson(text)
+  const raw = String(text ?? "").trim().slice(0, 160)
+  if (!json) return { ok: false, said: "", data: {}, raw }
+  const code = json.error_code ?? json.errorCode ?? json.code
+  const ok = code === undefined
+    ? json.success === true
+    : String(code) === "0000" || String(code) === "0"
+  const said = firstOf(json.error_msg, json.errorMsg, json.message, json.msg)
+  return { ok, said, data: asRecord(json.result ?? json.data ?? json), raw }
+}
+
+function benefitRecord(data) {
+  return Boolean(firstOf(data?.channel, data?.user_id, data?.user_name) || num(data?.create_time) > 0)
+}
+
+/** The ops API's envelope, as the web app writes it: `{code: 0, data}`. */
+function opsEnvelope(text) {
+  const raw = String(text ?? "").trim().slice(0, 200)
+  const json = safeJson(text)
+  if (!json) return { ok: false, said: raw, data: {}, raw }
+  const code = json.code ?? json.error_code ?? json.errorCode ?? json.resultCode
+  const ok = code === undefined
+    ? json.success !== false
+    : [0, "0", "0000", 200, "200", "SUCCESS", "success"].includes(code)
+  const said = firstOf(json.message, json.msg, json.error_msg, json.errorMsg, json.resultMsg)
+  return { ok, code, said, data: asRecord(json.data ?? json.result ?? json), raw }
+}
+
+/** The first positive number under one of `keys`, through nested objects. */
+function findNumber(data, keys, depth = 0) {
+  if (!data || typeof data !== "object" || depth > 3) return NaN
+  for (const key of keys) {
+    const n = num(data[key])
+    if (n > 0) return n
+  }
+  for (const value of Object.values(data)) {
+    if (value && typeof value === "object") {
+      const n = findNumber(value, keys, depth + 1)
+      if (n > 0) return n
+    }
+  }
+  return NaN
+}
+
+// What a claim's `data` calls its amount. `totalAmount`/`benefitAmount` are the
+// fields the live ops API actually returns (measured 2026-10-20); the rest are
+// the shapes older deployments and tests use.
+const OPS_CREDIT_KEYS = ["credit", "credits", "points", "point", "rewardPoints", "benefitPoints", "totalAmount", "benefitAmount", "amount"]
+
+/** The credits a claim/confirm answer carries, `{}` when it carries none. */
+function creditExtras(source) {
+  const credit = findNumber(source, OPS_CREDIT_KEYS)
+  return credit > 0 ? { credit } : {}
+}
+
+/** The USER_LOGIN campaign's row, from `data.items[]`. */
+function checkinItem(data) {
+  const items = Array.isArray(data?.items) ? data.items : Array.isArray(data?.list) ? data.list : []
+  return items.find((item) => item
+    && (Number(item.campaignId ?? item.campaign_id) === OPS_CAMPAIGN_ID || item.type === "USER_LOGIN")) ?? null
+}
+
+const stateOf = (item) => String(item?.status ?? "").toUpperCase()
+const isBooked = (state) => state === "CONFIRMED" || state === "CONSUMED"
+
+/** Headers the IDE's ops route signs, and therefore must receive verbatim. */
+const OPS_SIGNED_HEADERS = {
+  "agent-type": "PromptCenter",
+  "x-language": "zh-cn",
+  "content-type": "application/json",
+}
+
+/**
+ * Does this body belong to the ops API at all? The ops envelope is `{code,data}`
+ * (or a bare `{data:{items}}`); the benefit endpoints answer `{error_code,result}`
+ * with no `code`, and both live on the same signed credential — so a walk that
+ * guesses wrong must fall through instead of reading one as the other.
+ */
+function looksLikeOpsAnswer(text) {
+  const json = safeJson(text)
+  return Boolean(json) && ("code" in json || Array.isArray(json.data?.items))
+}
+
+/**
+ * Today's check-in through the IDE's signed ops route: the same walk
+ * `WelfareActivityServiceImpl` performs (delivery → claim → confirm,
+ * `channel: IDE`) without the popup around it. Same canonical-request contract
+ * as `signedFetch`: the query string and `OPS_SIGNED_HEADERS` are part of the
+ * signature, so they are sent exactly as signed.
+ *
+ * Returns `null` when the route is not offered to this account, so the caller
+ * can report the free-benefit enrollment instead; otherwise an outcome object:
+ *   claimed  — credits booked today
+ *   done     — already booked today
+ *   inactive — campaign not offered / switched off
+ *   failed   — the vendor answered, but not with a booking
+ */
+async function signedOpsCheckin(cred, fetcher) {
+  const ops = (method, url, body = "{}") =>
+    signedCall(cred, fetcher, method, url, { body, signedHeaders: OPS_SIGNED_HEADERS })
+
+  let delivery
+  try {
+    delivery = await ops("GET", SNAP_OPS_DELIVERY_URL)
+  } catch {
+    return null // signing/network trouble: report the benefit state instead
+  }
+  if (delivery.status === 401 || delivery.status === 403 || delivery.status === 404) return null
+  if (delivery.status !== 200) return { outcome: "failed", message: `delivery: HTTP ${delivery.status}` }
+  // A 200 that is not an ops answer means this route is not the ops API for
+  // this account (a benefit reply, an HTML page…): fall through, do not guess.
+  if (!looksLikeOpsAnswer(delivery.text)) return null
+  const list = opsEnvelope(delivery.text)
+  if (!list.ok) {
+    // APIG.0101: the gateway has no such route for this account.
+    if (/APIG\.0101/.test(`${list.said} ${list.raw}`)) return null
+    return { outcome: "failed", message: `delivery: ${list.said || list.raw}` }
+  }
+
+  const item = checkinItem(list.data)
+  if (!item) return { outcome: "inactive", message: "no USER_LOGIN campaign offered" }
+
+  const state = stateOf(item)
+  if (isBooked(state)) return { outcome: "done", ...creditExtras(item) }
+  if (state !== "ELIGIBLE" && state !== "CLAIMED") {
+    return { outcome: "failed", message: `unknown campaign state: ${state || "(empty)"}` }
+  }
+
+  let claimData
+  if (state === "ELIGIBLE") {
+    const claimed = await ops("POST", SNAP_OPS_CLAIM_URL, JSON.stringify({
+      campaignId: OPS_CAMPAIGN_ID,
+      channel: "IDE",
+      idempotentKey: `claim_${OPS_CAMPAIGN_ID}_${Date.now()}`,
+    }))
+    if (claimed.status !== 200) return { outcome: "failed", message: `claim: HTTP ${claimed.status}` }
+    const reply = opsEnvelope(claimed.text)
+    // A claim the site refuses is a failure; a repeat claim for the same day
+    // comes back as an error too, so the re-read below decides what it is.
+    // `40001 尚未到达权益刷新时间` is that same "already taken today" answer.
+    const sameDay =
+      String(reply.code ?? "") === "40001"
+      || saidMatches(reply.said, ["已领取", "已签到", "重复", "already", "duplicate", "尚未到达权益刷新时间"])
+    if (!reply.ok && !sameDay) {
+      return { outcome: "failed", message: `claim: ${reply.said || reply.raw}` }
+    }
+    claimData = reply.data
+  }
+
+  // Booking happens on confirm, so it also runs when the claim was already
+  // taken today (state CLAIMED) or was a repeat.
+  const confirmed = await ops("POST", SNAP_OPS_CONFIRM_URL, JSON.stringify({ campaignId: OPS_CAMPAIGN_ID }))
+  if (confirmed.status !== 200) return { outcome: "failed", message: `confirm: HTTP ${confirmed.status}` }
+  const booked = opsEnvelope(confirmed.text)
+  if (!booked.ok) return { outcome: "failed", message: `confirm: ${booked.said || booked.raw}` }
+  // The activity's own amount is the honest answer: the claim's, then the
+  // campaign row's. A confirm reply can carry the account's whole credit pool
+  // (`totalAmount` across every campaign), which is not what today's check-in
+  // earned, so it is only the last resort.
+  const result = { ...creditExtras(booked.data), ...creditExtras(item), ...creditExtras(claimData) }
+
+  // The confirm reply *is* the booking: once it says CONFIRMED the credits are
+  // in, even while the read side still serves its pre-confirm snapshot.
+  // Measured 2026-10-20: right after a successful claim+confirm, `delivery`
+  // answered `ELIGIBLE` for a few hundred ms — enough to make a re-read-only
+  // implementation report a false "claim not booked".
+  let bookedState = stateOf(booked.data)
+  if (isBooked(bookedState)) return { outcome: "claimed", ...result }
+
+  // No state in the reply: re-read, tolerating the replica lag.
+  for (let attempt = 0; attempt < OPS_REREAD_ATTEMPTS; attempt++) {
+    if (attempt > 0) await delay(OPS_REREAD_DELAY_MS)
+    const after = await ops("GET", SNAP_OPS_DELIVERY_URL)
+    const rereadItem = checkinItem(opsEnvelope(after.text).data)
+    bookedState = stateOf(rereadItem)
+    if (isBooked(bookedState)) return { outcome: "claimed", ...creditExtras(rereadItem), ...result }
+  }
+  return { outcome: "failed", message: `claim not booked: state ${bookedState || "(empty)"} after confirm` }
+}
+
+/** `enabled` off the campaign switch, or undefined when the answer lacks it. */
+function gatewayEnabled(text) {
+  const json = safeJson(text)
+  const value = String(json?.enabled ?? json?.result?.enabled ?? json?.data?.enabled)
+  return ["true", "1"].includes(value) ? true : ["false", "0"].includes(value) ? false : undefined
+}
+
+/**
+ * The free-benefit enrollment, reported when the ops route is not offered. It
+ * is a different thing from the credit check-in (`/api/v1/benefit/claim`
+ * enrols, it does not book credits) and never invents a credit.
+ */
+async function benefitCheckin(cred, fetcher) {
+  const failed = (message) => ({ outcome: "failed", message })
+  const unreadable = (reply) => reply.said || reply.raw || "unknown answer"
+  const PORTAL = "https://codearts.huaweicloud.com/portal/settings/personal-usage"
+  const classify = (reply) => {
+    if (saidMatches(reply.said, ["已领取", "已签到", "已经领取", "重复领取", "今日已", "already", "duplicate"])) {
+      return { outcome: "inactive", message: `${reply.said}（每日积分签到在网页端 ${PORTAL}）` }
+    }
+    if (saidMatches(reply.said, ["未开始", "已结束", "未开启", "not started", "has ended"])) {
+      return { outcome: "inactive", message: reply.said }
+    }
+    if (saidMatches(reply.said, ["无资格", "不具备", "不满足", "not eligible", "ineligible"])) {
+      return { outcome: "ineligible", message: reply.said }
+    }
+    return undefined
+  }
+  try {
+    const gate = await signedCall(cred, fetcher, "GET", BENEFIT_GATEWAY_CONFIG_URL, {
+      signedHeaders: { "agent-type": "PromptCenter", "x-language": "zh-cn" },
+    })
+    if (gate.status === 403 || gate.status === 404) {
+      return { outcome: "inactive", message: `no free-benefit program (gateway ${gate.status})` }
+    }
+    if (gate.status !== 200) return failed(`benefit gateway: HTTP ${gate.status}`)
+    if (gatewayEnabled(gate.text) === false) return { outcome: "inactive", message: "the free-benefit program is off" }
+
+    const state = await signedCall(cred, fetcher, "GET", OPENGW_CLAIM_URL)
+    if (state.status !== 200) return failed(`benefit state: HTTP ${state.status}`)
+    const before = parseClaimReply(state.text)
+    if (!before.ok) return classify(before) ?? failed(`benefit state: ${unreadable(before)}`)
+    // Already in: the record is there and POST only rewrites it, which is
+    // why claiming every day looked like it worked and changed nothing.
+    if (benefitRecord(before.data)) {
+      return { outcome: "inactive", message: `免费福利已开通（每日免费 Tokens 按日清零）；每日积分签到在网页端 ${PORTAL}` }
+    }
+
+    const enrolled = await signedCall(cred, fetcher, "POST", OPENGW_CLAIM_URL)
+    if (enrolled.status !== 200) return failed(`benefit claim: HTTP ${enrolled.status}`)
+    const after = parseClaimReply(enrolled.text)
+    if (after.ok) {
+      return { outcome: "claimed", message: `免费福利已到账（每日免费 Tokens）；每日积分签到在网页端 ${PORTAL}` }
+    }
+    return classify(after) ?? failed(`benefit claim: ${unreadable(after)}`)
+  } catch (e) {
+    return failed(e?.message ?? String(e))
   }
 }
 
@@ -900,11 +1031,6 @@ async function signedGet(url, cred, fetcher, extraUnsignedHeaders) {
 function createConcurrencyGate(limit) {
   let active = 0
   const waiters = []
-  const admit = () => {
-    if (active >= limit || waiters.length === 0) return
-    active += 1
-    waiters.shift()()
-  }
   return {
     acquire() {
       if (active < limit) {
@@ -913,9 +1039,11 @@ function createConcurrencyGate(limit) {
       }
       return new Promise((resolve) => waiters.push(resolve))
     },
+    // A waiter inherits the released slot, so `active` only drops when nobody waits.
     release() {
-      active -= 1
-      admit()
+      const next = waiters.shift()
+      if (next) next()
+      else active -= 1
     },
   }
 }
@@ -933,7 +1061,6 @@ function delay(ms, signal) {
     }
     const onAbort = () => {
       clearTimeout(timer)
-      signal?.removeEventListener("abort", onAbort)
       reject(abortError(signal))
     }
     const timer = setTimeout(() => {
@@ -942,24 +1069,6 @@ function delay(ms, signal) {
     }, ms)
     signal?.addEventListener("abort", onAbort, { once: true })
   })
-}
-
-/**
- * Stable per-account ids. A CodeArts session survives 60-90s after its
- * request and counts against the account's session budget the whole time, so
- * one account keeps one `Session-Id`/`Chat-Id` instead of opening a new
- * session per request. The id is minted at sign-in, stored with the
- * credential and kept across refreshes; older credentials fall back to their
- * account identifiers.
- */
-function accountSessionIds(cred) {
-  const seed = firstOf(cred.session_id, cred.user_id, cred.user_name, cred.access_key_id)
-  return { sessionId: seed, chatId: `chat-${seed}` }
-}
-
-/** `400` + `TM.00001041` is transient account capacity, not a bad request. */
-function isQueueErrorResponse(status, text) {
-  return status === 400 && text.includes("TM.00001041")
 }
 
 /**
@@ -972,34 +1081,6 @@ function isQueueErrorResponse(status, text) {
 function isRetryableQueueCode(text) {
   if (text.includes("TM.00001041")) return true
   return /81111|TPM|(^|[^0-9])429([^0-9]|$)|rate.?limit|too.?many.?requests/i.test(text)
-}
-
-/**
- * The `error_code` of the first error event in an SSE body, `""` when there is
- * none. CodeArts reports a dead quota, an expired credential and the session cap
- * alike this way, so the code is the only thing that tells them apart.
- */
-function sseErrorCode(text) {
-  const m = /"error_code"\s*:\s*"([^"]+)"/.exec(text)
-  return m ? m[1] : ""
-}
-
-/** `InferHub.4291.x` is an exhausted quota; `8111x` is a per-minute limit. */
-function isQuotaExhaustedCode(code) {
-  return /4291/.test(code)
-}
-
-/** `APIG.0602` is the temporary credential past its expiry, not a bad request. */
-function isExpiredCredentialResponse(text) {
-  return /APIG\.0602|security token has expired/i.test(text)
-}
-
-/**
- * A refresh the server refuses for good (its one-time token is spent) leaves the
- * account unusable until someone signs in again. Network hiccups must not.
- */
-function isPermanentRefreshFailure(error) {
-  return /STS5\.1806|invalid refresh token|refresh token has been used/i.test(String(error?.message ?? error))
 }
 
 /** Does this SSE event carry part of an answer (not just a role or a keepalive)? */
@@ -1021,19 +1102,18 @@ function sseEventHasContent(event) {
  */
 function classifySseHead(text) {
   if (!text) return undefined
-  const events = parseSseEvents(text)
-  if (events.some(sseEventHasContent)) return { kind: "content" }
-  const code = sseErrorCode(text)
-  if (code) {
-    // A half-arrived event is not an answer yet: wait for its newline.
-    if (!text.includes("\n\n")) return undefined
-    if (isRetryableQueueCode(text)) return { kind: "retry" }
-    // 429 and 5xx are the shapes magpie fails over to another account on; the
-    // vendor's own body is kept so the agent shows its words.
-    return { kind: "terminal", code, status: isQuotaExhaustedCode(code) ? 429 : 502 }
-  }
+  if (parseSseEvents(text).some(sseEventHasContent)) return { kind: "content" }
+  // A half-arrived event is not an answer yet: wait for its newline.
   if (!text.includes("\n\n")) return undefined
-  return { kind: "content" }
+  // CodeArts reports a dead quota, an expired credential and the session cap
+  // alike as an `error_code`, so the code is the only thing that tells them apart.
+  const code = /"error_code"\s*:\s*"([^"]+)"/.exec(text)?.[1]
+  if (!code) return { kind: "content" }
+  if (isRetryableQueueCode(text)) return { kind: "retry" }
+  // 429 and 5xx are the shapes magpie fails over to another account on; the
+  // vendor's own body is kept so the agent shows its words. `InferHub.4291.x`
+  // is an exhausted quota.
+  return { kind: "terminal", status: /4291/.test(code) ? 429 : 502 }
 }
 
 /** Headers for a body we hand over unchanged (length/encoding no longer hold). */
@@ -1058,39 +1138,32 @@ function rebuildResponse(res, text) {
  * cap, a dead quota and an expired credential as error events inside a 200 SSE
  * stream; a 200 never fails over, so the caller would see a truncated answer
  * (`Stream ended without finish_reason`) instead of a retry or another account.
- * The bytes read here are replayed into the stream handed over, so a real answer
- * still reaches the caller intact.
+ * Returns the response to hand over (the bytes read here are replayed into its
+ * stream, so a real answer still reaches the caller intact), or `null` when the
+ * stream is a retryable queue rejection.
  */
 async function peekSseQueueError(res) {
-  if (!res.body) return { retry: false, response: res }
+  if (!res.body) return res
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   const buffered = []
   let seen = ""
   let verdict
-  for (;;) {
-    verdict = classifySseHead(seen)
-    if (verdict || seen.length >= SSE_PEEK_LIMIT) break
+  while (!(verdict = classifySseHead(seen)) && seen.length < SSE_PEEK_LIMIT) {
     const { value, done } = await reader.read()
     if (done) break
     buffered.push(value)
     seen += decoder.decode(value, { stream: true })
   }
+  // Upstream's stream is discarded, not awaited: Node's reader.cancel can stay
+  // pending on a live body.
   if (verdict?.kind === "retry") {
-    // Discard upstream's stream: the caller gets a fresh attempt instead.
-    // Not awaited: Node's reader.cancel can stay pending on a live body.
     void reader.cancel().catch(() => {})
-    return { retry: true, response: null }
+    return null
   }
   if (verdict?.kind === "terminal") {
     void reader.cancel().catch(() => {})
-    return {
-      retry: false,
-      response: new Response(seen, {
-        status: verdict.status,
-        headers: { "content-type": "text/event-stream" },
-      }),
-    }
+    return new Response(seen, { status: verdict.status, headers: { "content-type": "text/event-stream" } })
   }
   // Replay what was read, then keep forwarding the rest with back pressure.
   const body = new ReadableStream({
@@ -1101,24 +1174,14 @@ async function peekSseQueueError(res) {
         return
       }
       const { value, done } = await reader.read()
-      if (done) {
-        controller.close()
-        return
-      }
-      controller.enqueue(value)
+      if (done) controller.close()
+      else controller.enqueue(value)
     },
     async cancel(reason) {
       await reader.cancel(reason).catch(() => {})
     },
   })
-  return {
-    retry: false,
-    response: new Response(body, {
-      status: res.status,
-      statusText: res.statusText,
-      headers: streamHeaders(res.headers),
-    }),
-  }
+  return new Response(body, { status: res.status, statusText: res.statusText, headers: streamHeaders(res.headers) })
 }
 
 /** A 401 magpie reads as "this login is gone": mark it and move to the next account. */
@@ -1130,34 +1193,25 @@ function signInExpiredResponse(body) {
 }
 
 /** Answer the caller with a 429 when upstream never frees its queue. */
-function queueTerminalResponse(status) {
+function queueTerminalResponse(probed) {
   return new Response(
-    JSON.stringify({ error_code: "TM.00001041", error_msg: firstOf(status.message, "CodeArts: queue is full") }),
+    JSON.stringify({ error_code: "TM.00001041", error_msg: firstOf(probed.message, "CodeArts: queue is full") }),
     { status: 429, headers: { "content-type": "application/json" } },
   )
 }
 
 /** Is this session queued upstream? `undefined` when the endpoint says nothing. */
-async function queryQueueStatus(cred, model, context) {
-  const url = `${QUEUE_STATUS_URL}?model=${encodeURIComponent(model)}&task_id=${encodeURIComponent(context.sessionId)}`
-  const signed = await signRequestHuawei(
-    cred.access_key_id, cred.secret_access_key, cred.security_token,
-    "GET", url, new Uint8Array(),
-  )
-  const headers = new Headers()
-  signed.forEach((value, key) => {
-    if (key !== "host") headers.set(key, value)
-  })
-  headers.set("x-snap-traceid", randomHex(16))
-  headers.set("Agent-Type", "INFERHUB_AGENT")
-  headers.set("X-Language", "en")
+async function queryQueueStatus(cred, model, { sessionId, fetcher, signal }) {
+  const url = `${QUEUE_STATUS_URL}?model=${encodeURIComponent(model)}&task_id=${encodeURIComponent(sessionId)}`
   try {
-    const res = await context.fetcher(url, { method: "GET", headers, signal: context.signal })
-    if (!res.ok) return undefined
-    const body = safeJson(await res.text())
-    const status = body?.status
-    if (status !== "waiting" && status !== "working" && status !== "error" && status !== "queue_full") return undefined
-    return { status, queuePosition: num(body.queue_position), message: firstOf(body.message) }
+    const { status: http, text } = await signedCall(cred, fetcher, "GET", url, {
+      signal,
+      headers: { "x-snap-traceid": randomHex(16), "Agent-Type": "INFERHUB_AGENT", "X-Language": "en" },
+    })
+    if (http < 200 || http >= 300) return undefined
+    const body = safeJson(text)
+    if (!["waiting", "working", "error", "queue_full"].includes(body?.status)) return undefined
+    return { status: body.status, message: firstOf(body.message) }
   } catch {
     return undefined
   }
@@ -1187,12 +1241,7 @@ function parseModelInfo(m, seen) {
   const rawName = m.model_name
   const name = typeof rawName === "string" && rawName ? normalizeModelId(rawName) : prettify(base)
   // gateway/config publishes per-model windows; prefer them over the static map.
-  return {
-    id: rawId,
-    name,
-    context: num(m.context_window) || CONTEXT_WINDOWS[base],
-    output: num(m.max_tokens) || undefined,
-  }
+  return { id: rawId, name, context: num(m.context_window) || CONTEXT_WINDOWS[base] }
 }
 
 function extractArray(text, path) {
@@ -1212,46 +1261,37 @@ function extractArray(text, path) {
 async function fetchRemoteModels(cred, fetcher) {
   const models = []
   const seen = new Set()
-  const benefitIds = []
-
-  const gatewayText = await signedGet(OPENGW_GATEWAY_CONFIG_URL, cred, fetcher)
-  if (gatewayText !== undefined) {
-    const arr = extractArray(gatewayText, ["result", "models"])
-    for (const item of arr ?? []) {
+  const sources = [
+    { url: OPENGW_GATEWAY_CONFIG_URL, path: ["result", "models"], benefit: true },
+    {
+      url: SNAP_MODEL_BUILTIN_URL,
+      path: ["builtinModels"],
+      headers: { "Content-Type": "application/json", "Agent-Type": "PromptCenter", "X-Language": "zh-cn" },
+    },
+  ]
+  for (const { url, path, benefit, headers } of sources) {
+    const text = await signedGet(url, cred, fetcher, headers)
+    for (const item of extractArray(text ?? "", path) ?? []) {
       const mi = parseModelInfo(item, seen)
       if (!mi) continue
-      mi.benefit = true
-      benefitIds.push(mi.id)
+      if (benefit) {
+        mi.benefit = true
+        if (!benefitModelIds.includes(mi.id)) benefitModelIds.push(mi.id)
+      }
       models.push(mi)
     }
   }
-
-  const snapText = await signedGet(SNAP_MODEL_BUILTIN_URL, cred, fetcher, {
-    "Content-Type": "application/json",
-    "Agent-Type": "PromptCenter",
-    "X-Language": "zh-cn",
-  })
-  if (snapText !== undefined) {
-    const arr = extractArray(snapText, ["builtinModels"])
-    for (const item of arr ?? []) {
-      const mi = parseModelInfo(item, seen)
-      if (mi) models.push(mi)
-    }
-  }
-
-  rememberBenefitIds(benefitIds)
   return models
 }
 
+const TOTAL_CREDIT_LABEL = "总积分"
 /** Chinese labels for the credit metric buckets CodeArts reports. */
 const CREDIT_METRIC_LABELS = {
-  usageTotalPackageCredit: "总积分",
+  usageTotalPackageCredit: TOTAL_CREDIT_LABEL,
   usageBasicPackageCredit: "基础积分包",
   usageOnDemandPackageCredit: "按需积分包",
   usageBonusPackageCredit: "赠送积分包",
 }
-const TOTAL_CREDIT_METRIC = "usageTotalPackageCredit"
-const BENEFIT_WINDOW_LABEL = "免费额度"
 
 /** Compact credit counts for the display string (12345 → "1.2万"). */
 function formatCredit(n) {
@@ -1274,7 +1314,7 @@ function benefitWindow(raw, ids = []) {
   if (limit <= 0) return undefined
   const used = Math.max(0, Math.min(num(rec.daily_tokens_used), limit))
   return {
-    name: BENEFIT_WINDOW_LABEL,
+    name: "免费额度",
     used: (used / limit) * 100,
     display: `${formatCredit(used)} / ${formatCredit(limit)}`,
     amount: used,
@@ -1296,13 +1336,13 @@ function creditWindow(name, limit, remain) {
   const used = Math.max(0, limit - remain)
   return {
     name,
-    used: clamp(limit > 0 ? ((limit - remain) / limit) * 100 : 0),
+    used: limit > 0 ? Math.min(100, (used / limit) * 100) : 0,
     display: `${formatCredit(used)} / ${formatCredit(limit)}`,
     amount: used,
     limit,
     unit: "credits",
     // Only the package total may pause the account; the rest are breakdowns.
-    ...(name !== CREDIT_METRIC_LABELS[TOTAL_CREDIT_METRIC] ? { aside: true } : {}),
+    ...(name !== TOTAL_CREDIT_LABEL ? { aside: true } : {}),
   }
 }
 
@@ -1331,8 +1371,7 @@ function usageFromStatistics(raw, benefitRaw, benefitIds = benefitModelIds) {
 
   // Keep the package total on top, then the per-bucket breakdown, then the
   // separate free-quota pool.
-  const totalLabel = CREDIT_METRIC_LABELS[TOTAL_CREDIT_METRIC]
-  windows.sort((a, b) => (a.name === totalLabel ? -1 : b.name === totalLabel ? 1 : 0))
+  windows.sort((a, b) => (a.name === TOTAL_CREDIT_LABEL ? -1 : b.name === TOTAL_CREDIT_LABEL ? 1 : 0))
   const benefit = benefitWindow(benefitRaw, benefitIds)
   if (benefit) windows.push(benefit)
 
@@ -1349,12 +1388,8 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
   const maxInflight = options?.maxInflight ?? ACCOUNT_MAX_INFLIGHT
   const gates = new Map()
   const gateFor = (key) => {
-    let gate = gates.get(key)
-    if (!gate) {
-      gate = createConcurrencyGate(maxInflight)
-      gates.set(key, gate)
-    }
-    return gate
+    if (!gates.has(key)) gates.set(key, createConcurrencyGate(maxInflight))
+    return gates.get(key)
   }
 
   const configModel = (m) => ({
@@ -1386,7 +1421,7 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
       config.provider[PROVIDER] ??= {}
       const p = config.provider[PROVIDER]
       p.name ??= "CodeArts"
-      p.npm ??= NPM
+      p.npm ??= "@ai-sdk/openai-compatible" // chat completions
       p.api ??= CHAT_API_BASE
       p.models = { ...Object.fromEntries(CATALOG.map((m) => [m.id, configModel(m)])), ...p.models }
     },
@@ -1416,18 +1451,12 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
       async refresh(auth) {
         const cred = credentialOf(auth)
         if (!cred) return undefined
-        const next = await refreshCredential(cred, fetcher)
-        return {
-          access: JSON.stringify(next),
-          refresh: next.refresh_token,
-          expires: expiresFromCredential(next),
-        }
+        return authRecord(await refreshCredential(cred, fetcher))
       },
 
       // Every request the account makes is signed here.
       async loader(getAuth) {
-        const auth = await getAuth()
-        let cred = credentialOf(auth)
+        let cred = credentialOf(await getAuth())
         if (!cred || !cred.secret_access_key) return {}
 
         // Kept for hosts that ignore `auth.refresh` (OpenCode / old magpie):
@@ -1441,32 +1470,35 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
         // what that is worth (the old credential, or a 401).
         const renewCredential = () => {
           if (signInDead || !cred.refresh_token) return null
-          if (!refreshing) {
-            refreshing = refreshCredential(cred, fetcher)
-              .then((next) => {
-                cred = next
-                void persistCredential(client, next)
-                return next
-              })
-              .catch((error) => {
-                if (isPermanentRefreshFailure(error)) signInDead = true
-                return null
-              })
-              .finally(() => { refreshing = null })
-          }
+          refreshing ??= refreshCredential(cred, fetcher)
+            .then((next) => {
+              cred = next
+              void persistCredential(client, next)
+              return next
+            })
+            .catch((error) => {
+              // Only a refresh the server refuses for good kills the account; a
+              // network hiccup must not.
+              if (/STS5\.1806|invalid refresh token|refresh token has been used/i.test(String(error?.message ?? error))) {
+                signInDead = true
+              }
+              return null
+            })
+            .finally(() => { refreshing = null })
           return refreshing
         }
-        const current = async () => {
-          if (signInDead || !cred.refresh_token || Date.parse(cred.expires_at || 0) - Date.now() > REFRESH_LEAD_MS) return cred
-          return (await renewCredential()) ?? cred
-        }
 
-        // One account = one session id pair, and one gate for its request budget.
-        const accountKey = firstOf(cred.session_id, cred.user_id, cred.user_name, cred.access_key_id)
+        // One account = one session id pair (a CodeArts session survives 60-90s
+        // after its request and counts against the account's session budget the
+        // whole time), and one gate for its request budget. The id is minted at
+        // sign-in and kept across refreshes; older credentials fall back to
+        // their account identifiers.
+        const seed = firstOf(cred.session_id, cred.user_id, cred.user_name, cred.access_key_id)
         const context = {
-          ...accountSessionIds(cred),
+          sessionId: seed,
+          chatId: `chat-${seed}`,
           fetcher,
-          gate: gateFor(accountKey),
+          gate: gateFor(seed),
           queueRetryDelayMs,
           queueMaxAttempts,
           renewCredential,
@@ -1475,16 +1507,17 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
         return {
           baseURL: CHAT_API_BASE,
           async fetch(input, init = {}) {
-            const c = await current()
-            return signedFetch(c, input, init, context)
+            const expiring = !signInDead && cred.refresh_token
+              && Date.parse(cred.expires_at || 0) - Date.now() <= REFRESH_LEAD_MS
+            const current = expiring ? (await renewCredential()) ?? cred : cred
+            return signedFetch(current, input, init, context)
           },
         }
       },
 
       // magpie's own hook: how much of the plan is left.
       async usage(getAuth) {
-        const auth = await getAuth()
-        const cred = credentialOf(auth)
+        const cred = credentialOf(await getAuth())
         if (!cred) return { error: "not signed in", windows: [] }
         try {
           const text = await signedGet(SNAP_STATISTICS_URL, cred, fetcher, {
@@ -1495,10 +1528,21 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
           // The free-quota panel is best-effort: a credit account with no
           // benefit pool is normal, so its absence must not fail the whole read.
           const benefitText = await signedGet(BENEFIT_BALANCE_URL, cred, fetcher)
-          return usageFromStatistics(safeJson(text), benefitText === undefined ? undefined : safeJson(benefitText))
+          return usageFromStatistics(safeJson(text), safeJson(benefitText ?? ""))
         } catch (e) {
           return { error: e?.message ?? String(e), windows: [] }
         }
+      },
+
+      // magpie's own hook: the account's daily check-in (签到), the 1000-credit
+      // `USER_LOGIN` campaign, claimed on the IDE's signed ops route — the same
+      // temporary credential the chat models use, no web session needed. When
+      // that route is not offered, it reports the free-benefit enrollment.
+      async checkin(getAuth) {
+        const cred = credentialOf(await getAuth())
+        if (!cred) return { outcome: "failed", message: "not signed in" }
+        // An ops-route error falls through: the benefit report is the last word.
+        return (await signedOpsCheckin(cred, fetcher).catch(() => null)) ?? benefitCheckin(cred, fetcher)
       },
 
       methods: [
@@ -1513,17 +1557,10 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
               method: "auto",
               async callback() {
                 try {
-                  const outcome = await flow.result
-                  const cred = safeJson(outcome.access)
+                  const cred = await flow.result
                   if (!cred?.access_key_id) return { type: "failed", error: "CodeArts did not return a credential" }
                   const accountId = firstOf(cred.user_name, cred.user_id)
-                  return {
-                    type: "success",
-                    access: outcome.access,
-                    refresh: cred.refresh_token,
-                    expires: outcome.expires,
-                    ...(accountId ? { accountId } : {}),
-                  }
+                  return { type: "success", ...authRecord(cred), ...(accountId ? { accountId } : {}) }
                 } catch (e) {
                   return { type: "failed", error: e?.message ?? String(e) }
                 } finally {
@@ -1541,15 +1578,7 @@ export const CodeArtsAuthPlugin = async ({ client } = {}, options = {}) => {
 /** Best-effort: store a freshly refreshed credential back on the account. */
 async function persistCredential(client, cred) {
   try {
-    await client?.auth?.set?.({
-      path: { id: PROVIDER },
-      body: {
-        type: "oauth",
-        access: JSON.stringify(cred),
-        refresh: cred.refresh_token,
-        expires: expiresFromCredential(cred),
-      },
-    })
+    await client?.auth?.set?.({ path: { id: PROVIDER }, body: { type: "oauth", ...authRecord(cred) } })
   } catch {
     /* best effort */
   }
@@ -1557,24 +1586,15 @@ async function persistCredential(client, cred) {
 
 // for tests (never a plugin: magpie only calls exported functions)
 export const _internal = {
-  PROVIDER, NPM, CATALOG, CONTEXT_WINDOWS, BENEFIT_MODEL_FALLBACK,
-  CHAT_API_BASE, SNAP_MODEL_BUILTIN_URL, SNAP_STATISTICS_URL, OPENGW_GATEWAY_CONFIG_URL, BENEFIT_BALANCE_URL,
-  QUEUE_STATUS_URL, QUEUE_RETRY_DELAY_MS, QUEUE_MAX_ATTEMPTS, ACCOUNT_MAX_INFLIGHT,
-  PORTAL_AUTHORIZE_BASE, STS_TOKEN_ENDPOINT, CLIENT_ID, REDIRECT_PATH,
-  firstOf, asRecord, safeJson, num, clamp, prettify, normalizeModelId, formatCredit,
-  b64url, utf8, sha256Hex, hmacSha256Hex,
-  generatePkcePair, generateDpopKeyPair, keyPairFromStoredJwk, signDpopJws,
-  buildCanonicalRequest, signRequestHuawei,
-  credentialFromTokenResponse, credentialOf, expiresFromCredential,
-  requestToken, exchangeAuthorizationCode, exchangeRefreshToken, refreshCredential,
-  buildOAuthLoginUrl, buildPortalLoginResultUrl, parseLegacyCredential, pollForCredential,
-  startOAuthCallbackServer, listenOnCallbackPort, startOAuthFlow,
-  toBytes, isBenefitModel, rememberBenefitIds, signedFetch, signedGet,
-  createConcurrencyGate, delay, abortError, accountSessionIds,
-  isQueueErrorResponse, isRetryableQueueCode, streamHeaders, rebuildResponse,
-  sseErrorCode, isQuotaExhaustedCode, isExpiredCredentialResponse,
-  isPermanentRefreshFailure, sseEventHasContent, classifySseHead, signInExpiredResponse,
-  needsStreamMetering, parseSseEvents, completionFromChunks, benefitWindow, creditWindow,
-  peekSseQueueError, queueTerminalResponse, queryQueueStatus,
+  CHAT_API_BASE, OPENGW_CLAIM_URL, BENEFIT_GATEWAY_CONFIG_URL, QUEUE_STATUS_URL, ACCOUNT_MAX_INFLIGHT, STS_TOKEN_ENDPOINT,
+  SNAP_OPS_BASE, SNAP_OPS_DELIVERY_URL, SNAP_OPS_CLAIM_URL, SNAP_OPS_CONFIRM_URL, OPS_SIGNED_HEADERS,
+  normalizeModelId, b64url, sha256Hex, hmacSha256Hex,
+  generatePkcePair, generateDpopKeyPair, signDpopJws, signRequestHuawei,
+  credentialFromTokenResponse, credentialOf, expiresFromCredential, refreshCredential,
+  buildOAuthLoginUrl, startOAuthFlow,
+  isBenefitModel, signedGet, signedCall,
+  isRetryableQueueCode,
+  parseSseEvents, completionFromChunks, benefitWindow, creditWindow,
   parseModelInfo, extractArray, fetchRemoteModels, usageFromStatistics,
+  parseClaimReply, benefitRecord, gatewayEnabled, opsEnvelope,
 }
